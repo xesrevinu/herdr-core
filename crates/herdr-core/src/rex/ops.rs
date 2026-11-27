@@ -462,7 +462,22 @@ impl RexBridge {
         if !argv.is_empty() {
             params.insert("argv".into(), json!(argv));
         }
-        let res = call_internal(&self.core, None, "terminal.run", Value::Object(params)).await?;
+        let res = match call_internal(&self.core, None, "terminal.run", Value::Object(params.clone())).await {
+            Ok(r) => r,
+            Err(e) if !on.is_empty() && e.message.contains("cannot start") => {
+                if let Some(fb) = remote_shell_fallback(argv) {
+                    if fb.is_empty() {
+                        params.remove("argv");
+                    } else {
+                        params.insert("argv".into(), json!(fb));
+                    }
+                    call_internal(&self.core, None, "terminal.run", Value::Object(params)).await?
+                } else {
+                    return Err(e.into());
+                }
+            }
+            Err(e) => return Err(e.into()),
+        };
         let addr = res["address"].as_str().unwrap_or_default().to_string();
         if !addr.is_empty() {
             let _ = call_internal(
@@ -2846,5 +2861,20 @@ fn match_machine(prefix: &str, local_name: &str, machines: &[String]) -> Option<
         Some(suffix.remove(0))
     } else {
         None
+    }
+}
+
+pub(crate) fn remote_shell_fallback(argv: &[String]) -> Option<Vec<String>> {
+    let first = argv.first()?.as_str();
+    let base = first.rsplit('/').next().unwrap_or(first);
+    if !matches!(base, "zsh" | "fish" | "nu" | "bash") {
+        return None;
+    }
+    match argv.get(1).map(String::as_str) {
+        None if argv.len() == 1 => Some(Vec::new()),
+        Some("-l" | "--login") if argv.len() == 2 => Some(Vec::new()),
+        Some("-lc") if argv.len() == 3 => Some(vec!["/bin/sh".into(), "-lc".into(), argv[2].clone()]),
+        Some("-c") if argv.len() == 3 => Some(vec!["/bin/sh".into(), "-c".into(), argv[2].clone()]),
+        _ => None,
     }
 }

@@ -4,7 +4,7 @@ use super::appdoc::*;
 use super::bridge::RexBridge;
 use super::hub::{feed_pty_modes, take_osc52};
 use super::model::Ids;
-use super::ops::{check_layout, create_target, leaf_command, leaf_cwd};
+use super::ops::{check_layout, create_target, leaf_command, leaf_cwd, remote_shell_fallback};
 use super::proto::*;
 use super::register_all;
 use super::server::RexServer;
@@ -816,4 +816,12 @@ fn transfer_tab_and_rev21_independent_zoom() {
     let win_both = ids.window(&tab, &panes, &lay, &floats, Some("t1"), Some("t2"));
     assert_eq!(win_both.tiled_zoomed_block_id, Some(ids.rex("block", "t1")));
     assert_eq!(win_both.zoomed_block_id, Some(ids.rex("block", "t2")));
+
+    assert_eq!(remote_shell_fallback(&["zsh".into(), "-l".into()]), Some(Vec::new()));
+    assert_eq!(remote_shell_fallback(&["/bin/zsh".into()]), Some(Vec::new()));
+    assert_eq!(
+        remote_shell_fallback(&["/bin/zsh".into(), "-lc".into(), "lazygit".into()]),
+        Some(vec!["/bin/sh".into(), "-lc".into(), "lazygit".into()]),
+    );
+    assert_eq!(remote_shell_fallback(&["lazygit".into()]), None);
 }
