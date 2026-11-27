@@ -40,6 +40,8 @@ pub const TERMINAL_METHODS: &[&str] = &[
     "upload_begin",
     "download_begin",
     "list_dir",
+    "modes",
+    "ports",
     "blob_read",
     "clipboard_read",
 ];
@@ -47,6 +49,85 @@ pub const TERMINAL_METHODS: &[&str] = &[
 const PASTE_START: &str = "\x1b[200~";
 const PASTE_END: &str = "\x1b[201~";
 const LIST_DIR_LIMIT: usize = 2000;
+
+const PORTS_PY: &str = r#"
+import json, os, re, subprocess, sys, datetime
+root_pid = int(sys.argv[1])
+def descendants(rpid):
+    children = {}
+    meta = {}
+    out = subprocess.check_output(["ps", "-eo", "pid=,ppid=,uid=,user=,comm="], text=True, stderr=subprocess.DEVNULL)
+    for line in out.splitlines():
+        parts = line.strip().split(None, 4)
+        if len(parts) < 5: continue
+        try:
+            pid, ppid, uid = int(parts[0]), int(parts[1]), int(parts[2])
+        except ValueError:
+            continue
+        children.setdefault(ppid, []).append(pid)
+        meta[pid] = {"pid": pid, "user_id": uid, "user": parts[3], "name": os.path.basename(parts[4].strip())}
+    res, stack = set(), [rpid]
+    while stack:
+        cur = stack.pop()
+        if cur in res: continue
+        res.add(cur)
+        stack.extend(children.get(cur, ()))
+    return res, meta
+
+try:
+    pids, meta = descendants(root_pid)
+except Exception:
+    print(json.dumps({"status": "partial", "ports": [], "processes": []})); raise SystemExit
+
+now = datetime.datetime.now(datetime.timezone.utc).isoformat().replace("+00:00", "Z")
+ports = []
+seen = set()
+status = "ok"
+
+def add_port(pid, addr, port):
+    if pid not in pids: return
+    if addr == "*": addr = "0.0.0.0"
+    if addr.startswith("::ffff:"): addr = addr[7:]
+    key = ("tcp", addr, port)
+    if key in seen: return
+    seen.add(key)
+    ports.append({"port": port, "address": addr, "protocol": "tcp", "first_seen_at": now, "pid": pid})
+
+if sys.platform == "darwin":
+    try:
+        out = subprocess.check_output(["lsof", "-nP", "-iTCP", "-sTCP:LISTEN", "-F", "pn"], text=True, stderr=subprocess.DEVNULL)
+        cur_pid = 0
+        for line in out.splitlines():
+            if line.startswith("p"):
+                cur_pid = int(line[1:])
+            elif line.startswith("n") and cur_pid in pids:
+                spec = line[1:].strip()
+                if "->" in spec: spec = spec.split("->", 1)[0]
+                m = re.match(r'^\[([^\]]+)\]:(\d+)$', spec) or re.match(r'^([^:]+):(\d+)$', spec)
+                if m:
+                    add_port(cur_pid, m.group(1), int(m.group(2)))
+    except Exception:
+        status = "partial"
+else:
+    try:
+        out = subprocess.check_output(["ss", "-ltnpH"], text=True, stderr=subprocess.DEVNULL)
+        for line in out.splitlines():
+            cols = line.split()
+            if len(cols) < 4: continue
+            local = cols[3]
+            m = re.match(r'^\[([^\]]+)\]:(\d+)$', local) or re.match(r'^(.+):(\d+)$', local)
+            if not m: continue
+            addr, port = m.group(1), int(m.group(2))
+            for pm in re.finditer(r'pid=(\d+)', line):
+                add_port(int(pm.group(1)), addr, port)
+    except Exception:
+        status = "partial"
+
+ports.sort(key=lambda x: (x["port"], x["address"]))
+used_pids = sorted({p["pid"] for p in ports})
+procs = [meta[pid] for pid in used_pids if pid in meta]
+print(json.dumps({"status": status, "ports": ports, "processes": procs}))
+"#;
 
 const LIST_DIR_PY: &str = r#"
 import os, json, sys
@@ -225,6 +306,11 @@ pub async fn h_block_method(
         "list_dir" => {
             let x = b.pane(&pane).await?;
             b.term_list_dir(&x, args).await
+        }
+        "modes" => b.term_modes(&pane),
+        "ports" => {
+            let x = b.pane(&pane).await?;
+            b.term_ports(&x).await
         }
         "blob_read" => b.term_blob_read(BLOB_KIND_RESULT, args),
         "clipboard_read" => b.term_blob_read(BLOB_KIND_CLIPBOARD, args),
@@ -801,6 +887,59 @@ impl RexBridge {
         }
         let home = self.local_home();
         Ok(list_directory(&path, &cwd, &home, &prefix, files, limit))
+    }
+
+    pub fn term_modes(&self, pane: &str) -> Result<Value, RexError> {
+        if let Some(h) = self.hub(pane)
+            && let Some(v) = h.modes_snapshot()
+        {
+            return Ok(v);
+        }
+        if machine_of(pane).is_empty()
+            && let Some(id) = crate::terminals::parse_id(pane)
+        {
+            let st = self.core.lock();
+            if let Some(screen) = st.screens.get(&id) {
+                return Ok(super::hub::modes_from_screen(screen));
+            }
+        }
+        Ok(json!({
+            "screen": "primary",
+            "modes": [],
+        }))
+    }
+
+    pub async fn term_ports(&self, pane: &Pane) -> Result<Value, RexError> {
+        let on = machine_of(&pane.id).to_string();
+        let root_pid = pane.pid;
+        if root_pid <= 0 {
+            return Ok(json!({"status": "ok", "ports": [], "processes": []}));
+        }
+        if !on.is_empty() {
+            return self.ports_remote(&on, root_pid).await;
+        }
+        tokio::task::spawn_blocking(move || inspect_local_ports(root_pid))
+            .await
+            .map_err(|e| RexError::internal(format!("ports task failed: {e}")))
+    }
+
+    async fn ports_remote(&self, on: &str, root_pid: i64) -> Result<Value, RexError> {
+        for py in ["python3", "python"] {
+            let params = json!({
+                "on": on,
+                "argv": [py, "-c", PORTS_PY, root_pid.to_string()],
+                "timeout": 8.0,
+            });
+            if let Ok(res) = call_internal(&self.core, None, "machine.exec", params).await
+                && res["code"].as_i64() == Some(0)
+                && let Some(b64) = res["stdout"].as_str()
+                && let Ok(raw) = B64.decode(b64)
+                && let Ok(v) = serde_json::from_slice::<Value>(&raw)
+            {
+                return Ok(v);
+            }
+        }
+        Ok(json!({"status": "unsupported", "ports": [], "processes": []}))
     }
 
     async fn list_dir_remote(
@@ -1908,6 +2047,20 @@ fn download_io_err(path: &str, e: &std::io::Error) -> RexError {
         std::io::ErrorKind::PermissionDenied => RexError::new("forbidden", format!("permission denied: {path}"), 403),
         _ => RexError::bad_request(format!("{path}: {e}")),
     }
+}
+
+fn inspect_local_ports(root_pid: i64) -> Value {
+    for py in ["python3", "python"] {
+        if let Ok(out) = std::process::Command::new(py)
+            .args(["-c", PORTS_PY, &root_pid.to_string()])
+            .output()
+            && out.status.success()
+            && let Ok(v) = serde_json::from_slice::<Value>(&out.stdout)
+        {
+            return v;
+        }
+    }
+    json!({"status": "unsupported", "ports": [], "processes": []})
 }
 
 fn file_version(meta: &std::fs::Metadata, mtime: SystemTime) -> Option<String> {

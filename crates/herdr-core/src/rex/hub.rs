@@ -239,6 +239,22 @@ impl Hub {
         fallback
     }
 
+    pub fn modes_snapshot(&self) -> Option<Value> {
+        {
+            let inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+            if let Some(vt) = inner.remote_vt.as_ref() {
+                return Some(modes_from_screen(vt));
+            }
+        }
+        if let Some(id) = crate::terminals::parse_id(&self.pane) {
+            let st = self.bridge.core.lock();
+            if let Some(screen) = st.screens.get(&id) {
+                return Some(modes_from_screen(screen));
+            }
+        }
+        None
+    }
+
     pub fn encode_key_event(&self, ev: &super::term::RexKeyEvent) -> Option<Vec<u8>> {
         {
             let inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
@@ -1110,6 +1126,42 @@ pub struct PtyNote {
 /// Filters PTY bytes for Rex.app: strips mouse/focus/paste DECSET so Rex stays
 /// controlled by herdrex, records mode transitions, and reasserts paste/focus
 /// after RIS (`\x1bc`) and DECSTR (`\x1b[!p`). Never disables autowrap.
+pub fn modes_from_screen(screen: &ghostty_vt::Terminal) -> Value {
+    const DEC_MODES: &[(&str, u16, bool)] = &[
+        ("cursor_keys", 1, false),
+        ("origin", 6, false),
+        ("wraparound", 7, true),
+        ("cursor_visible", 25, true),
+        ("alt_screen_legacy", 47, false),
+        ("mouse_event_normal", 1000, false),
+        ("mouse_event_button", 1002, false),
+        ("mouse_event_any", 1003, false),
+        ("focus_event", 1004, false),
+        ("mouse_format_sgr", 1006, false),
+        ("alt_screen", 1047, false),
+        ("alt_screen_save_cursor_clear_enter", 1049, false),
+        ("bracketed_paste", 2004, false),
+        ("synchronized_output", 2026, false),
+        ("grapheme_cluster", 2027, true),
+        ("report_color_scheme", 2031, false),
+    ];
+    let mut modes = Vec::with_capacity(DEC_MODES.len());
+    for &(name, number, def) in DEC_MODES {
+        let mut entry = Map::new();
+        entry.insert("name".into(), Value::String(name.into()));
+        entry.insert("number".into(), json!(number));
+        entry.insert("set".into(), Value::Bool(screen.dec_mode(number)));
+        if def {
+            entry.insert("default".into(), Value::Bool(true));
+        }
+        modes.push(Value::Object(entry));
+    }
+    json!({
+        "screen": if screen.alt_screen() { "alternate" } else { "primary" },
+        "modes": modes,
+    })
+}
+
 pub fn feed_pty_modes(pending: &[u8], chunk: &[u8]) -> (Vec<u8>, Vec<u8>, PtyNote) {
     let mut buf = Vec::with_capacity(pending.len() + chunk.len());
     buf.extend_from_slice(pending);

@@ -2,7 +2,7 @@
 //! block ownership, bootstrap tickets, and `herdr-app` doc mutations.
 
 use super::appdoc::*;
-use super::bridge::{FloatMark, REBALANCE_WINDOW, RexBridge, pwd_of, workspace_of};
+use super::bridge::{FloatMark, FocusEntry, REBALANCE_WINDOW, RexBridge, UndoEntry, pwd_of, workspace_of};
 use super::model::{FloatLayer, RexView};
 use super::proto::*;
 use super::server::{DataRequest, RexClient};
@@ -140,7 +140,11 @@ impl RexBridge {
                 continue;
             };
             let floats = self.tab_floats(&t.id);
-            v.windows.push(self.ids.window(t, &panes, &root, &floats));
+            let (tz, fz) = {
+                let st = self.st.lock().unwrap_or_else(|p| p.into_inner());
+                (st.tiled_zoomed.get(&t.id).cloned(), st.float_zoomed.get(&t.id).cloned())
+            };
+            v.windows.push(self.ids.window(t, &panes, &root, &floats, tz.as_deref(), fz.as_deref()));
             active = active || t.id == ws.active_tab_id;
         }
         self.set_owners(&mut v);
@@ -258,12 +262,56 @@ impl RexBridge {
     }
 
     pub fn set_core_focus(&self, space: &str, tab: &str, addr: &str) {
+        self.set_core_focus_opts(space, tab, addr, true);
+    }
+
+    pub fn set_core_focus_opts(&self, space: &str, tab: &str, addr: &str, record_history: bool) {
         let mut st = self.st.lock().unwrap_or_else(|p| p.into_inner());
         if !space.is_empty() && !tab.is_empty() {
             st.active_tab.insert(space.to_string(), tab.to_string());
         }
         if !tab.is_empty() && !addr.is_empty() {
             st.active_pane.insert(tab.to_string(), addr.to_string());
+            let is_float = st
+                .floats
+                .get(tab)
+                .is_some_and(|fs| fs.iter().any(|f| f.pane_id == addr));
+            if is_float {
+                // Rev 21: keep tiled_zoomed intact while focus is in a floating layer;
+                // clear float_zoomed only if focus moved to another floating pane.
+                if st.float_zoomed.get(tab).is_some_and(|z| z != addr) {
+                    st.float_zoomed.remove(tab);
+                }
+            } else {
+                // Moving focus to another tiled pane ends tiled zoom (Rev 21).
+                if st.tiled_zoomed.get(tab).is_some_and(|z| z != addr) {
+                    st.tiled_zoomed.remove(tab);
+                }
+            }
+            let cur_zoomed = if is_float {
+                st.float_zoomed.get(tab).is_some_and(|z| z == addr)
+            } else {
+                st.tiled_zoomed.get(tab).is_some_and(|z| z == addr)
+            };
+            if cur_zoomed {
+                st.zoomed.insert(tab.to_string(), true);
+            } else {
+                st.zoomed.remove(tab);
+            }
+            if record_history && !space.is_empty() {
+                st.focus_history.retain(|e| e.pane_id != addr);
+                st.focus_history.insert(
+                    0,
+                    FocusEntry {
+                        space_id: space.to_string(),
+                        tab_id: tab.to_string(),
+                        pane_id: addr.to_string(),
+                    },
+                );
+                if st.focus_history.len() > 128 {
+                    st.focus_history.truncate(128);
+                }
+            }
         }
     }
 
@@ -273,6 +321,41 @@ impl RexBridge {
             st.zoomed.insert(tab.to_string(), true);
         } else {
             st.zoomed.remove(tab);
+            st.tiled_zoomed.remove(tab);
+            st.float_zoomed.remove(tab);
+        }
+    }
+
+    pub fn set_layer_zoom(&self, tab: &str, pane: &str, zoomed: bool) {
+        let mut st = self.st.lock().unwrap_or_else(|p| p.into_inner());
+        let is_float = st
+            .floats
+            .get(tab)
+            .is_some_and(|fs| fs.iter().any(|f| f.pane_id == pane));
+        if is_float {
+            if zoomed {
+                st.float_zoomed.insert(tab.to_string(), pane.to_string());
+            } else {
+                st.float_zoomed.remove(tab);
+            }
+        } else if zoomed {
+            st.tiled_zoomed.insert(tab.to_string(), pane.to_string());
+        } else {
+            st.tiled_zoomed.remove(tab);
+        }
+        if zoomed {
+            st.zoomed.insert(tab.to_string(), true);
+        } else {
+            st.zoomed.remove(tab);
+        }
+    }
+
+    pub fn push_undo(&self, client_id: &str, entry: UndoEntry) {
+        let mut st = self.st.lock().unwrap_or_else(|p| p.into_inner());
+        let stack = st.undo_stack.entry(client_id.to_string()).or_default();
+        stack.push(entry);
+        if stack.len() > 32 {
+            stack.remove(0);
         }
     }
 
@@ -758,6 +841,55 @@ pub async fn h_version() -> Result<Value, RexError> {
     }))
 }
 
+pub async fn h_privacy_status(c: &RexClient) -> Result<Value, RexError> {
+    if !c.is_unix() {
+        return Err(RexError::new(
+            "forbidden",
+            "server.apple.privacy_status is only allowed over a local Unix socket",
+            403,
+        ));
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let fda = probe_macos_fda();
+        let mut out = json!({
+            "services": [
+                {"service": "full_disk_access", "status": fda},
+                {"service": "screen_recording", "status": "unknown"},
+                {"service": "microphone", "status": "unknown"},
+                {"service": "camera", "status": "unknown"},
+            ],
+        });
+        if let Ok(exe) = std::env::current_exe() {
+            out["responsible_path"] = Value::String(exe.to_string_lossy().into_owned());
+        }
+        Ok(out)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Ok(json!({"services": []}))
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn probe_macos_fda() -> &'static str {
+    let Ok(home) = std::env::var("HOME") else {
+        return "unknown";
+    };
+    for rel in [
+        "Library/Application Support/com.apple.TCC/TCC.db",
+        "Library/Safari/Bookmarks.plist",
+    ] {
+        let p = std::path::Path::new(&home).join(rel);
+        match std::fs::File::open(&p) {
+            Ok(_) => return "granted",
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => return "denied",
+            Err(_) => continue,
+        }
+    }
+    "unknown"
+}
+
 pub async fn h_grant_file_access(c: &RexClient, p: &Value) -> Result<Value, RexError> {
     const MAX_FILES: usize = 256;
     if !c.is_unix() {
@@ -1086,13 +1218,42 @@ pub async fn h_create(b: &Arc<RexBridge>, c: &RexClient, p: &Value) -> Result<Va
     }))
 }
 
-pub async fn h_destroy(b: &RexBridge, p: &Value) -> Result<Value, RexError> {
+pub async fn h_destroy(b: &RexBridge, c: &RexClient, p: &Value) -> Result<Value, RexError> {
     let w = match b.herdr_id(str_arg(p, "session_id"), "session") {
         Ok(w) => w,
         Err(e) if gone(&e) => return Ok(json!({})),
         Err(e) => return Err(e),
     };
     let on = b.on_of(&w);
+    if p.get("undoable").and_then(Value::as_bool) == Some(true)
+        && let Some(snap) = b.snapshot()
+        && let Some(ws) = workspace_of(&snap, &w)
+    {
+        let mut windows = Vec::new();
+        for t in snap.tabs.iter().filter(|t| t.workspace_id == w) {
+            let ps: Vec<(String, String)> = snap
+                .panes
+                .iter()
+                .filter(|x| x.tab_id == t.id)
+                .map(|x| (pwd_of(x).to_string(), x.label.clone()))
+                .collect();
+            windows.push((t.label.clone(), ps));
+        }
+        let folder = windows
+            .first()
+            .and_then(|(_, ps)| ps.first())
+            .map(|(cwd, _)| cwd.clone())
+            .unwrap_or_default();
+        b.push_undo(
+            &c.id,
+            UndoEntry::Session {
+                on: on.clone(),
+                label: ws.label.clone(),
+                folder,
+                windows,
+            },
+        );
+    }
     let mut addrs = Vec::new();
     let res: Result<_, RexError> = b
         .edit_doc(&on, |doc| {
@@ -1175,7 +1336,7 @@ pub async fn h_new_window(b: &RexBridge, c: &RexClient, p: &Value) -> Result<Val
     }))
 }
 
-pub async fn h_close_window(b: &RexBridge, p: &Value) -> Result<Value, RexError> {
+pub async fn h_close_window(b: &RexBridge, c: &RexClient, p: &Value) -> Result<Value, RexError> {
     let sid = str_arg(p, "session_id");
     let ws = match b.herdr_id(sid, "session") {
         Ok(ws) => ws,
@@ -1188,6 +1349,26 @@ pub async fn h_close_window(b: &RexBridge, p: &Value) -> Result<Value, RexError>
         Err(e) => return Err(e),
     };
     let on = b.on_of(&ws);
+    if p.get("undoable").and_then(Value::as_bool) == Some(true)
+        && let Some(snap) = b.snapshot()
+        && let Some(trec) = snap.tabs.iter().find(|t| t.id == tab)
+    {
+        let panes: Vec<(String, String)> = snap
+            .panes
+            .iter()
+            .filter(|x| x.tab_id == tab)
+            .map(|x| (pwd_of(x).to_string(), x.label.clone()))
+            .collect();
+        b.push_undo(
+            &c.id,
+            UndoEntry::Window {
+                on: on.clone(),
+                space_id: ws.clone(),
+                label: trec.label.clone(),
+                panes,
+            },
+        );
+    }
     let mut addrs = Vec::new();
     let res = b
         .edit_doc(&on, |doc| {
@@ -1301,13 +1482,27 @@ pub async fn h_new_split(b: &RexBridge, c: &RexClient, p: &Value) -> Result<Valu
     }))
 }
 
-pub async fn h_block_close(b: &RexBridge, p: &Value) -> Result<Value, RexError> {
+pub async fn h_block_close(b: &RexBridge, c: Option<&RexClient>, p: &Value) -> Result<Value, RexError> {
     let x = match b.block_or_focused(p).await {
         Ok(x) => x,
         Err(e) if gone(&e) => return Ok(b.ack_close(p, "").await),
         Err(e) => return Err(e),
     };
     let on = b.on_of(&x.workspace_id);
+    if let Some(c) = c
+        && p.get("undoable").and_then(Value::as_bool) == Some(true)
+    {
+        b.push_undo(
+            &c.id,
+            UndoEntry::Pane {
+                on: on.clone(),
+                space_id: x.workspace_id.clone(),
+                tab_id: x.tab_id.clone(),
+                cwd: pwd_of(&x).to_string(),
+                label: x.label.clone(),
+            },
+        );
+    }
     let local = local_addr(&x.id, &on);
     let mut addrs = Vec::new();
     let res = b
@@ -1399,13 +1594,21 @@ pub async fn h_zoom(b: &RexBridge, p: &Value) -> Result<Value, RexError> {
     };
     let cur = {
         let st = b.st.lock().unwrap_or_else(|p| p.into_inner());
-        let was = st.zoomed.get(&x.tab_id).copied().unwrap_or(false);
+        let is_float = st
+            .floats
+            .get(&x.tab_id)
+            .is_some_and(|fs| fs.iter().any(|f| f.pane_id == x.id));
+        let was = if is_float {
+            st.float_zoomed.get(&x.tab_id).is_some_and(|z| z == &x.id)
+        } else {
+            st.tiled_zoomed.get(&x.tab_id).is_some_and(|z| z == &x.id)
+        };
         match p.get("zoom").and_then(Value::as_bool) {
             Some(z) => z,
             None => !was,
         }
     };
-    b.set_core_zoom(&x.tab_id, cur);
+    b.set_layer_zoom(&x.tab_id, &x.id, cur);
     b.set_core_focus(&x.workspace_id, &x.tab_id, &x.id);
     Ok(json!({
         "block_id": b.ids.rex("block", &x.id),
@@ -1473,6 +1676,277 @@ pub async fn h_move_window(b: &RexBridge, p: &Value) -> Result<Value, RexError> 
     })
     .await?;
     Ok(json!({"revision": b.settle(&ws).await}))
+}
+
+pub async fn h_transfer_window(b: &RexBridge, c: &RexClient, p: &Value) -> Result<Value, RexError> {
+    let from_sid = str_arg(p, "session_id");
+    let to_sid = str_arg(p, "to_session_id");
+    if from_sid.is_empty() || to_sid.is_empty() {
+        return Err(RexError::bad_request("session_id and to_session_id are required"));
+    }
+    if from_sid == to_sid {
+        return Err(RexError::bad_request("to_session_id must be a different session"));
+    }
+    let from_ws = b.herdr_id(from_sid, "session")?;
+    let to_ws = b.herdr_id(to_sid, "session")?;
+    let wid = str_arg(p, "window_id");
+    if wid.is_empty() {
+        return Err(RexError::bad_request("window_id is required"));
+    }
+    let tab = b.herdr_id(wid, "window")?;
+    let before = {
+        let id = str_arg(p, "before_window_id");
+        if id.is_empty() { String::new() } else { b.herdr_id(id, "window")? }
+    };
+    let on = b.on_of(&from_ws);
+    if on != b.on_of(&to_ws) {
+        return Err(RexError::bad_request("cannot transfer a window between different machines"));
+    }
+    let mut moved_addrs = Vec::new();
+    b.edit_doc(&on, |doc| {
+        match doc_transfer_tab(doc, &from_ws, &tab, &to_ws, &before) {
+            Ok(a) => {
+                moved_addrs = a;
+                Ok(())
+            }
+            Err("same_session") => Err(RexError::bad_request("to_session_id must be a different session")),
+            Err("from_not_found") | Err("to_not_found") => Err(RexError::session_not_found("unknown session")),
+            Err(_) => Err(RexError::not_found("window is not in the session")),
+        }
+    })
+    .await?;
+
+    b.relabel_space(&on, &from_ws).await;
+    b.relabel_space(&on, &to_ws).await;
+    let focus = p.get("focus").and_then(Value::as_bool).unwrap_or(false);
+    if focus {
+        let addr = b
+            .st
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .active_pane
+            .get(&tab)
+            .cloned()
+            .unwrap_or_else(|| moved_addrs.first().map(|a| qualify(a, &on)).unwrap_or_default());
+        b.set_core_focus(&to_ws, &tab, &addr);
+    }
+    if c.attached(to_sid) {
+        let blocks: Vec<String> = moved_addrs
+            .iter()
+            .map(|a| b.ids.rex("block", &qualify(a, &on)))
+            .collect();
+        b.claim(c, &to_ws, &blocks).await;
+    }
+    let rev = b.settle(&from_ws).await;
+    let to_rev = b.settle(&to_ws).await;
+    Ok(json!({"revision": rev, "to_revision": to_rev}))
+}
+
+pub async fn h_focus_history_reverse(b: &RexBridge, c: &RexClient, p: &Value) -> Result<Value, RexError> {
+    let want_sid = str_arg(p, "session_id");
+    if !want_sid.is_empty() && !c.attached(want_sid) {
+        return Err(RexError::conflict("connection is not attached to this session"));
+    }
+    let not_sid = str_arg(p, "not_session_id");
+    let want_wid = str_arg(p, "window_id");
+    let not_wid = str_arg(p, "not_window_id");
+    let cursor = num_arg(p, "cursor").map(|n| n.max(0.0) as usize);
+
+    let snap = b.current().await;
+    let live: HashMap<&str, &Pane> = snap.panes.iter().map(|x| (x.id.as_str(), x)).collect();
+    let history = b.st.lock().unwrap_or_else(|e| e.into_inner()).focus_history.clone();
+
+    let start = cursor.unwrap_or(1);
+    for (idx, entry) in history.iter().enumerate().skip(start) {
+        let Some(pane) = live.get(entry.pane_id.as_str()) else {
+            continue;
+        };
+        let sid = b.ids.rex("session", &pane.workspace_id);
+        let wid = b.ids.rex("window", &pane.tab_id);
+        let bid = b.ids.rex("block", &pane.id);
+        if !want_sid.is_empty() && sid != want_sid {
+            continue;
+        }
+        if !not_sid.is_empty() && sid == not_sid {
+            continue;
+        }
+        if !want_wid.is_empty() && wid != want_wid {
+            continue;
+        }
+        if !not_wid.is_empty() && wid == not_wid {
+            continue;
+        }
+        // Unminimize if floating
+        {
+            let mut st = b.st.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(fs) = st.floats.get_mut(&pane.tab_id) {
+                for f in fs.iter_mut() {
+                    if f.pane_id == pane.id {
+                        f.minimized = false;
+                    }
+                }
+            }
+        }
+        b.set_core_focus_opts(&pane.workspace_id, &pane.tab_id, &pane.id, false);
+        b.settle(&pane.workspace_id).await;
+        return Ok(json!({
+            "reversed": true,
+            "cursor": idx + 1,
+            "session_id": sid,
+            "window_id": wid,
+            "block_id": bid,
+        }));
+    }
+    Ok(json!({"reversed": false}))
+}
+
+pub async fn h_undo_close(b: &Arc<RexBridge>, c: &RexClient) -> Result<Value, RexError> {
+    let entry = {
+        let mut st = b.st.lock().unwrap_or_else(|e| e.into_inner());
+        st.undo_stack.get_mut(&c.id).and_then(Vec::pop)
+    };
+    let Some(entry) = entry else {
+        return Err(RexError::not_found("nothing to undo"));
+    };
+    match entry {
+        UndoEntry::Pane { on, space_id, tab_id, cwd, label } => {
+            let snap = b.current().await;
+            let sid = b.ids.rex("session", &space_id);
+            let mut blk = json!({"flavor": SHELL_FLAVOR});
+            if !label.is_empty() {
+                blk["label"] = Value::String(label.clone());
+            }
+            if !cwd.is_empty() {
+                blk["options"] = json!({"cwd": cwd});
+            }
+            if snap.tabs.iter().any(|t| t.id == tab_id && t.workspace_id == space_id) {
+                let wid = b.ids.rex("window", &tab_id);
+                let res = h_new_split(
+                    b,
+                    c,
+                    &json!({
+                        "session_id": sid,
+                        "window_id": wid,
+                        "direction": "horizontal",
+                        "side": "after",
+                        "focus": true,
+                        "layout": {"block": blk},
+                    }),
+                )
+                .await?;
+                let bid = res["block_ids"][0].as_str().unwrap_or_default().to_string();
+                Ok(json!({"session_id": sid, "window_id": wid, "block_id": bid}))
+            } else if workspace_of(&snap, &space_id).is_some() {
+                let res = h_new_window(
+                    b,
+                    c,
+                    &json!({
+                        "session_id": sid,
+                        "label": label,
+                        "focus": true,
+                        "layout": {"block": blk},
+                    }),
+                )
+                .await?;
+                let wid = res["window_id"].as_str().unwrap_or_default().to_string();
+                let bid = res["block_ids"][0].as_str().unwrap_or_default().to_string();
+                Ok(json!({"session_id": sid, "window_id": wid, "block_id": bid}))
+            } else {
+                let res = h_create(
+                    b,
+                    c,
+                    &json!({
+                        "label": label,
+                        "on": on,
+                        "initial_windows": [{"layout": {"block": blk}}],
+                    }),
+                )
+                .await?;
+                let new_sid = res["session_id"].as_str().unwrap_or_default().to_string();
+                let new_wid = res["initial_windows"][0]["window_id"].as_str().unwrap_or_default().to_string();
+                let new_bid = res["initial_windows"][0]["block_ids"][0].as_str().unwrap_or_default().to_string();
+                Ok(json!({"session_id": new_sid, "window_id": new_wid, "block_id": new_bid}))
+            }
+        }
+        UndoEntry::Window { on, space_id, label, panes } => {
+            let snap = b.current().await;
+            let first = panes.first().cloned().unwrap_or_default();
+            let mut blk = json!({"flavor": SHELL_FLAVOR});
+            if !first.1.is_empty() {
+                blk["label"] = Value::String(first.1);
+            }
+            if !first.0.is_empty() {
+                blk["options"] = json!({"cwd": first.0});
+            }
+            if workspace_of(&snap, &space_id).is_some() {
+                let sid = b.ids.rex("session", &space_id);
+                let res = h_new_window(
+                    b,
+                    c,
+                    &json!({
+                        "session_id": sid,
+                        "label": label,
+                        "focus": true,
+                        "layout": {"block": blk},
+                    }),
+                )
+                .await?;
+                let wid = res["window_id"].as_str().unwrap_or_default().to_string();
+                let bid = res["block_ids"][0].as_str().unwrap_or_default().to_string();
+                Ok(json!({"session_id": sid, "window_id": wid, "block_id": bid}))
+            } else {
+                let res = h_create(
+                    b,
+                    c,
+                    &json!({
+                        "label": label,
+                        "on": on,
+                        "initial_windows": [{"window_label": label, "layout": {"block": blk}}],
+                    }),
+                )
+                .await?;
+                let new_sid = res["session_id"].as_str().unwrap_or_default().to_string();
+                let new_wid = res["initial_windows"][0]["window_id"].as_str().unwrap_or_default().to_string();
+                let new_bid = res["initial_windows"][0]["block_ids"][0].as_str().unwrap_or_default().to_string();
+                Ok(json!({"session_id": new_sid, "window_id": new_wid, "block_id": new_bid}))
+            }
+        }
+        UndoEntry::Session { on, label, folder, windows } => {
+            let mut init_wins = Vec::new();
+            for (wlbl, ps) in windows {
+                let first = ps.first().cloned().unwrap_or_else(|| (folder.clone(), String::new()));
+                let mut blk = json!({"flavor": SHELL_FLAVOR});
+                if !first.1.is_empty() {
+                    blk["label"] = Value::String(first.1);
+                }
+                if !first.0.is_empty() {
+                    blk["options"] = json!({"cwd": first.0});
+                }
+                init_wins.push(json!({"window_label": wlbl, "layout": {"block": blk}}));
+            }
+            if init_wins.is_empty() {
+                let mut blk = json!({"flavor": SHELL_FLAVOR});
+                if !folder.is_empty() {
+                    blk["options"] = json!({"cwd": folder});
+                }
+                init_wins.push(json!({"layout": {"block": blk}}));
+            }
+            let res = h_create(
+                b,
+                c,
+                &json!({
+                    "label": label,
+                    "on": on,
+                    "initial_windows": init_wins,
+                }),
+            )
+            .await?;
+            let new_sid = res["session_id"].as_str().unwrap_or_default().to_string();
+            let new_wid = res["initial_windows"][0]["window_id"].as_str().unwrap_or_default().to_string();
+            let new_bid = res["initial_windows"][0]["block_ids"][0].as_str().unwrap_or_default().to_string();
+            Ok(json!({"session_id": new_sid, "window_id": new_wid, "block_id": new_bid}))
+        }
+    }
 }
 
 pub async fn h_focus_pane_step(b: &RexBridge, p: &Value, delta: isize) -> Result<Value, RexError> {
@@ -1685,10 +2159,11 @@ pub async fn h_float_block(b: &RexBridge, c: &RexClient, p: &Value) -> Result<Va
             f.layer_id
         )));
     }
-    if let Some(l) = b.tab_layout(&x.tab_id)
-        && l.zoomed
     {
-        b.set_core_zoom(&x.tab_id, false);
+        let mut st = b.st.lock().unwrap_or_else(|p| p.into_inner());
+        if st.tiled_zoomed.get(&x.tab_id).is_some_and(|z| z == &x.id) {
+            st.tiled_zoomed.remove(&x.tab_id);
+        }
     }
     let f = FloatLayer {
         layer_id: format!("layer:{}", Uuid::new_v4()),
@@ -1717,9 +2192,6 @@ pub async fn h_new_layer(b: &RexBridge, c: &RexClient, p: &Value) -> Result<Valu
     let l = b
         .tab_layout(&tab)
         .ok_or_else(|| RexError::conflict("window has no blocks"))?;
-    if l.zoomed {
-        b.set_core_zoom(&tab, false);
-    }
     let mut anchor = l.focused.clone();
     let mut tiled = String::new();
     let mut cwd = leaf_cwd(layout);
@@ -1978,6 +2450,7 @@ pub async fn h_close_layer(b: &RexBridge, p: &Value) -> Result<Value, RexError> 
         if f.layer_id == lid {
             let _ = h_block_close(
                 b,
+                None,
                 &json!({"session_id": sid, "block_id": b.ids.rex("block", &f.pane_id)}),
             )
             .await?;

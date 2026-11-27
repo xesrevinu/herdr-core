@@ -30,6 +30,8 @@ pub struct RexWindow {
     pub layers: Vec<RexLayer>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub zoomed_block_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tiled_zoomed_block_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -143,7 +145,15 @@ impl Ids {
         }
     }
 
-    pub fn window(&self, t: &Tab, panes: &[Pane], l: &LayoutNode, floats: &[FloatLayer]) -> RexWindow {
+    pub fn window(
+        &self,
+        t: &Tab,
+        panes: &[Pane],
+        l: &LayoutNode,
+        floats: &[FloatLayer],
+        tiled_zoomed: Option<&str>,
+        float_zoomed: Option<&str>,
+    ) -> RexWindow {
         let floating: HashSet<&str> = floats.iter().map(|f| f.pane_id.as_str()).collect();
         let mut blocks = Vec::new();
         let mut by_pane = HashMap::new();
@@ -178,9 +188,23 @@ impl Ids {
                 blocks: vec![blk],
             });
         }
+        let tiled_zoom_pane = tiled_zoomed
+            .filter(|p| by_pane.contains_key(*p) && !floating.contains(*p))
+            .or_else(|| {
+                (l.zoomed && !l.focused.is_empty() && !floating.contains(l.focused.as_str()))
+                    .then_some(l.focused.as_str())
+            });
+        let tiled_zoomed_block_id = tiled_zoom_pane.map(|p| self.rex("block", p));
         let (focused_block_id, zoomed_block_id) = if !l.focused.is_empty() {
             let f = self.rex("block", &l.focused);
-            let z = if l.zoomed { Some(f.clone()) } else { None };
+            let focused_is_float = floating.contains(l.focused.as_str());
+            let z = if focused_is_float {
+                (float_zoomed == Some(l.focused.as_str())).then(|| f.clone())
+            } else if tiled_zoom_pane == Some(l.focused.as_str()) {
+                Some(f.clone())
+            } else {
+                None
+            };
             (Some(f), z)
         } else {
             (None, None)
@@ -191,6 +215,7 @@ impl Ids {
             focused_block_id,
             layers,
             zoomed_block_id,
+            tiled_zoomed_block_id,
         }
     }
 

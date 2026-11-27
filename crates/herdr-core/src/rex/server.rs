@@ -82,6 +82,7 @@ pub struct RexClient {
     pub id: String,
     pub principal: Value,
     pub connected_at: SystemTime,
+    pub api_revision: i64,
     trace: bool,
 
     seq: AtomicU64,
@@ -104,6 +105,7 @@ impl RexClient {
     fn new(
         principal: Value,
         info: Value,
+        api_revision: i64,
         trace: bool,
         tx: mpsc::UnboundedSender<OutMsg>,
     ) -> Self {
@@ -111,6 +113,7 @@ impl RexClient {
             id: format!("client:{}", Uuid::new_v4()),
             principal,
             connected_at: SystemTime::now(),
+            api_revision,
             trace,
             seq: AtomicU64::new(0),
             queued: AtomicUsize::new(0),
@@ -217,11 +220,16 @@ impl RexClient {
         }
         let seq = self.seq.fetch_add(1, Ordering::SeqCst) + 1;
         let msg = json!({"type": "event", "seq": seq, "payload": payload});
-        let text = marshal_rex(&msg);
+        let mut text = marshal_rex(&msg);
         if text.len() > MAX_MESSAGE_BYTES {
-            st.closed = true;
-            let _ = self.tx.send(OutMsg::Close(1009, "event exceeds message limit".into()));
-            return;
+            if self.api_revision >= 18 {
+                let dropped = build_event_dropped(&payload, text.len());
+                text = marshal_rex(&json!({"type": "event", "seq": seq, "payload": dropped}));
+            } else {
+                st.closed = true;
+                let _ = self.tx.send(OutMsg::Close(1009, "event exceeds message limit".into()));
+                return;
+            }
         }
         let prev = self.queued.fetch_add(text.len(), Ordering::SeqCst);
         if prev + text.len() > MAX_BACKLOG {
@@ -848,7 +856,7 @@ impl RexServer {
 
         let principal = make_principal(peer_addr.as_deref(), is_unix);
         let (out_tx, mut out_rx) = mpsc::unbounded_channel::<OutMsg>();
-        let client = Arc::new(RexClient::new(principal, hello["client"].clone(), self.trace, out_tx));
+        let client = Arc::new(RexClient::new(principal, hello["client"].clone(), revision, self.trace, out_tx));
 
         let client_writer = client.clone();
         let writer_task = tokio::spawn(async move {
@@ -1194,6 +1202,39 @@ impl RexServer {
             let _ = closed_tx.send(true);
         }
     }
+}
+
+fn build_event_dropped(payload: &Value, size: usize) -> Value {
+    let mut inner = Map::new();
+    let top_type = payload.get("type").and_then(Value::as_str).unwrap_or_default();
+    if top_type == "session_event" {
+        let p = payload.get("payload");
+        if let Some(sid) = p.and_then(|v| v.get("session_id")).and_then(Value::as_str)
+            && !sid.is_empty()
+        {
+            inner.insert("session_id".into(), Value::String(sid.to_string()));
+        }
+        let ev = p.and_then(|v| v.get("event"));
+        let ev_type = ev.and_then(|v| v.get("type")).and_then(Value::as_str).unwrap_or("session_event");
+        inner.insert("event_type".into(), Value::String(ev_type.to_string()));
+        if ev_type == "block_event"
+            && let Some(bp) = ev.and_then(|v| v.get("payload"))
+        {
+            if let Some(bid) = bp.get("block_id").and_then(Value::as_str) {
+                inner.insert("block_id".into(), Value::String(bid.to_string()));
+            }
+            if let Some(cn) = bp.get("creator_name").and_then(Value::as_str) {
+                inner.insert("creator_name".into(), Value::String(cn.to_string()));
+            }
+            if let Some(name) = bp.get("name").and_then(Value::as_str) {
+                inner.insert("block_event_name".into(), Value::String(name.to_string()));
+            }
+        }
+    } else {
+        inner.insert("event_type".into(), Value::String(top_type.to_string()));
+    }
+    inner.insert("size".into(), json!(size));
+    json!({"type": "event_dropped", "payload": Value::Object(inner)})
 }
 
 async fn reject_ws<S>(ws_tx: &mut futures_util::stream::SplitSink<WebSocketStream<S>, Message>, reason: u8, code: u16)

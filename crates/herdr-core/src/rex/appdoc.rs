@@ -560,6 +560,70 @@ pub fn doc_move_tab(doc: &mut Map<String, Value>, tab_id: &str, to: usize) -> bo
     false
 }
 
+pub fn doc_transfer_tab(
+    doc: &mut Map<String, Value>,
+    from_space: &str,
+    tab_id: &str,
+    to_space: &str,
+    before_tab: &str,
+) -> Result<Vec<String>, &'static str> {
+    if from_space == to_space {
+        return Err("same_session");
+    }
+    let Some(spaces) = doc.get_mut("spaces").and_then(Value::as_array_mut) else {
+        return Err("not_found");
+    };
+    let from_idx = spaces
+        .iter()
+        .position(|s| s.get("id").and_then(Value::as_str) == Some(from_space))
+        .ok_or("from_not_found")?;
+    let to_idx = spaces
+        .iter()
+        .position(|s| s.get("id").and_then(Value::as_str) == Some(to_space))
+        .ok_or("to_not_found")?;
+    if !before_tab.is_empty() {
+        let has_before = spaces[to_idx]
+            .get("tabs")
+            .and_then(Value::as_array)
+            .is_some_and(|ts| ts.iter().any(|t| t.get("id").and_then(Value::as_str) == Some(before_tab)));
+        if !has_before {
+            return Err("before_not_found");
+        }
+    }
+    let tab = {
+        let tabs = spaces[from_idx]
+            .get_mut("tabs")
+            .and_then(Value::as_array_mut)
+            .ok_or("tab_not_found")?;
+        let pos = tabs
+            .iter()
+            .position(|t| t.get("id").and_then(Value::as_str) == Some(tab_id))
+            .ok_or("tab_not_found")?;
+        tabs.remove(pos)
+    };
+    let mut addrs = Vec::new();
+    if let Some(root) = tab.get("root") {
+        addresses_of(root, &mut addrs);
+    }
+    let to_tabs = spaces[to_idx]
+        .as_object_mut()
+        .ok_or("to_not_found")?
+        .entry("tabs")
+        .or_insert_with(|| Value::Array(Vec::new()))
+        .as_array_mut()
+        .ok_or("to_not_found")?;
+    let at = if before_tab.is_empty() {
+        to_tabs.len()
+    } else {
+        to_tabs
+            .iter()
+            .position(|t| t.get("id").and_then(Value::as_str) == Some(before_tab))
+            .unwrap_or(to_tabs.len())
+    };
+    to_tabs.insert(at, tab);
+    Ok(addrs)
+}
+
 pub fn doc_move_spaces(doc: &mut Map<String, Value>, ids: &[String], before: &str) -> bool {
     let Some(spaces) = doc.get_mut("spaces").and_then(Value::as_array_mut) else {
         return false;

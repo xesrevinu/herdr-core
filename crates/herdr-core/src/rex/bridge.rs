@@ -104,6 +104,36 @@ struct PendingRefresh {
     docs: HashSet<String>,
 }
 
+#[derive(Debug, Clone)]
+pub struct FocusEntry {
+    pub space_id: String,
+    pub tab_id: String,
+    pub pane_id: String,
+}
+
+#[derive(Debug, Clone)]
+pub enum UndoEntry {
+    Pane {
+        on: String,
+        space_id: String,
+        tab_id: String,
+        cwd: String,
+        label: String,
+    },
+    Window {
+        on: String,
+        space_id: String,
+        label: String,
+        panes: Vec<(String, String)>,
+    },
+    Session {
+        on: String,
+        label: String,
+        folder: String,
+        windows: Vec<(String, Vec<(String, String)>)>,
+    },
+}
+
 #[derive(Default)]
 pub struct BridgeState {
     pub snap: Option<Snapshot>,
@@ -131,6 +161,11 @@ pub struct BridgeState {
     pub active_tab: HashMap<String, String>,
     pub active_pane: HashMap<String, String>,
     pub zoomed: HashMap<String, bool>,
+    pub tiled_zoomed: HashMap<String, String>,
+    pub float_zoomed: HashMap<String, String>,
+    pub focus_history: Vec<FocusEntry>,
+    pub undo_stack: HashMap<String, Vec<UndoEntry>>,
+    pub last_ports: HashMap<String, String>,
     pub keymap_gen: i64,
     pub keymap_hash: String,
 }
@@ -837,7 +872,72 @@ impl RexBridge {
             }).abort_handle());
         }
 
+        // 5. Listening TCP ports change watcher (Rev 16 ports_changed)
+        {
+            let b = self.clone();
+            handles.push(tokio::spawn(async move {
+                b.watch_ports().await;
+            }).abort_handle());
+        }
+
         handles
+    }
+
+    async fn watch_ports(self: &Arc<Self>) {
+        let mut tick = tokio::time::interval(Duration::from_secs(4));
+        tick.tick().await;
+        loop {
+            tick.tick().await;
+            let clients = self.srv.clients();
+            if clients.is_empty() {
+                continue;
+            }
+            let Some(snap) = self.snapshot() else {
+                continue;
+            };
+            let mut active_panes = Vec::new();
+            for p in &snap.panes {
+                if p.pid <= 0 {
+                    continue;
+                }
+                let sid = self.ids.rex("session", &p.workspace_id);
+                if clients.iter().any(|c| c.wants_block_events(&sid)) {
+                    active_panes.push(p.clone());
+                }
+            }
+            let mut live_ids = HashSet::with_capacity(active_panes.len());
+            for p in active_panes {
+                live_ids.insert(p.id.clone());
+                let Ok(val) = self.term_ports(&p).await else {
+                    continue;
+                };
+                let sig = ports_signature(&val);
+                let changed = {
+                    let mut st = self.st.lock().unwrap_or_else(|e| e.into_inner());
+                    match st.last_ports.get(&p.id) {
+                        Some(prev) if prev == &sig => false,
+                        Some(_) => {
+                            st.last_ports.insert(p.id.clone(), sig);
+                            true
+                        }
+                        None => {
+                            st.last_ports.insert(p.id.clone(), sig);
+                            val["ports"].as_array().is_some_and(|a| !a.is_empty())
+                        }
+                    }
+                };
+                if changed {
+                    let sid = self.ids.rex("session", &p.workspace_id);
+                    let bid = self.ids.rex("block", &p.id);
+                    self.emit_block_event(&sid, &bid, "ports_changed", val);
+                }
+            }
+            self.st
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .last_ports
+                .retain(|k, _| live_ids.contains(k));
+        }
     }
 
     async fn prune_finished_pane(&self, addr: &str) {
@@ -977,6 +1077,11 @@ impl RexBridge {
         self.release_owner(c);
         self.forget_client(&c.id);
         self.drop_uploads(&c.id);
+        self.st
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .undo_stack
+            .remove(&c.id);
     }
 
     pub fn release_owner(&self, c: &RexClient) {
@@ -1400,6 +1505,21 @@ enum RefreshMode<'a> {
     Cache,
     Machines,
     Only(&'a str),
+}
+
+fn ports_signature(val: &Value) -> String {
+    let mut parts = Vec::new();
+    if let Some(arr) = val["ports"].as_array() {
+        for p in arr {
+            parts.push(format!(
+                "{}:{}:{}",
+                p["address"].as_str().unwrap_or_default(),
+                p["port"].as_u64().unwrap_or(0),
+                p["pid"].as_i64().unwrap_or(0),
+            ));
+        }
+    }
+    parts.join(",")
 }
 
 pub fn pwd_of(p: &Pane) -> &str {

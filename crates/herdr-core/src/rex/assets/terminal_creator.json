@@ -78,6 +78,121 @@
     ],
     "additionalProperties": false
    },
+   "ports_changed": {
+    "type": "object",
+    "properties": {
+     "status": {
+      "type": "string",
+      "description": "How complete ports is: 'ok' if every process in the terminal was looked at, 'partial' if some could not be, so ports may be missing some, or 'unsupported' if this server cannot list ports for this terminal. Treat any other value as 'partial'."
+     },
+     "ports": {
+      "type": "array",
+      "items": {
+       "type": "object",
+       "properties": {
+        "port": {
+         "type": "integer",
+         "description": "The port number.",
+         "minimum": 0,
+         "maximum": 65535
+        },
+        "address": {
+         "type": "string",
+         "description": "The address the socket is bound to, as an IP literal with no brackets, such as 127.0.0.1, ::1, 0.0.0.0, or ::. An IPv4 address mapped into IPv6 is given as plain IPv4. An IPv6 link-local address keeps its zone, an interface index, as in fe80::1%1."
+        },
+        "protocol": {
+         "type": "string",
+         "description": "The transport protocol, 'tcp' today. Skip an entry whose protocol you don't know."
+        },
+        "first_seen_at": {
+         "type": "string",
+         "description": "When the server first saw this address and port held by this process in this terminal, as an RFC 3339 timestamp. The server looks in the background, every second while there is output or input in any terminal and every 5 minutes at most while nothing happens, and also when asked, so this can be minutes after the port opened. It changes if the port closes and opens again or another process holds it.",
+         "format": "date-time"
+        },
+        "pid": {
+         "type": "integer",
+         "description": "The ID of the process that holds the socket, or the first started of several that share it. The process is described by the entry in processes with the same pid. Left out when the server can't tell which process holds the socket, such as a server started with sudo, and the reply is then partial."
+        }
+       },
+       "required": [
+        "port",
+        "address",
+        "protocol",
+        "first_seen_at"
+       ],
+       "additionalProperties": false
+      },
+      "description": "The ports that programs in the terminal listen on, sorted by port and then by address, with one entry for each protocol, address and port. An empty array when nothing is listening."
+     },
+     "processes": {
+      "type": "array",
+      "items": {
+       "type": "object",
+       "properties": {
+        "pid": {
+         "type": "integer",
+         "description": "The process ID."
+        },
+        "user_id": {
+         "type": "integer",
+         "description": "The user ID the process runs as on Unix, which shows when a command runs as another user, such as with sudo. Zero on Windows."
+        },
+        "user": {
+         "type": "string",
+         "description": "The name of the account the process runs as. Left out if it can't be looked up."
+        },
+        "name": {
+         "type": "string",
+         "description": "The file name of the executable, such as zsh. When path is left out, the system's own name for the process, which Linux limits to 15 bytes. To label a process, use the first of script, argv0, and name that is present."
+        },
+        "path": {
+         "type": "string",
+         "description": "The absolute path of the executable, with symlinks resolved. Left out if it can't be read, as for another user's process on Linux."
+        },
+        "invoked_path": {
+         "type": "string",
+         "description": "The absolute path the executable was started through, before symlinks were resolved, such as a link in a bin directory. Present only when Rex can confirm it leads to the same file as path."
+        },
+        "argv0": {
+         "type": "string",
+         "description": "The first argument as the process shows it now, such as -zsh for a login shell, cut to 256 bytes. Rex never returns the other arguments, because they can hold secrets."
+        },
+        "script": {
+         "type": "string",
+         "description": "For an interpreter such as node or python, the absolute path of the script it is running, as the user named it. Left out for other programs."
+        },
+        "cwd": {
+         "type": "string",
+         "description": "The process's working directory, as an absolute path. Left out if it can't be read, as for another user's process."
+        }
+       },
+       "required": [
+        "pid",
+        "user_id",
+        "name"
+       ],
+       "additionalProperties": false
+      },
+      "description": "The processes that hold the ports, sorted by pid, with one entry for each, described as the process method describes them. A pid in ports with no entry here is a process the server couldn't describe. Each is described when its first port is found, so fields such as cwd show their value from then."
+     },
+     "truncated": {
+      "type": "boolean",
+      "description": "True if entries were left out from the end of ports so that the reply fits in one message. processes then describes only the processes that the remaining entries name. Left out when false."
+     },
+     "id": {
+      "type": "integer",
+      "description": "Set only when truncated is true. Names a stored copy of the whole reply, from the same scan. Read it with blob_read from offset 0 until eof, and decode the text as a ports reply. The server keeps it for a few minutes. Left out if the server couldn't store the copy.",
+      "minimum": 0
+     }
+    },
+    "description": "Sent when the TCP ports that programs in the terminal listen on change, such as when a development server starts or stops. It carries the whole list, the same reply the ports method gives, so replace the list you have. The server looks in the background, so a change can take from a second to a few minutes to arrive, and it sends at most one event a second for each terminal. It is also sent once when the terminal's program exits, if the last event listed ports.",
+    "required": [
+     "status",
+     "ports",
+     "processes"
+    ],
+    "additionalProperties": false
+   },
    "process_changed": {
     "type": "object",
     "properties": {
@@ -539,6 +654,128 @@
    }
   },
   "methods": {
+   "blob_read": {
+    "description": "Read a result that was too large for one reply or event, such as the output of format with max_bytes set, or a selection_copied event without text. The server keeps each result for about five minutes.",
+    "input_schema": {
+     "type": "object",
+     "properties": {
+      "id": {
+       "type": "integer",
+       "description": "The result to read, from the reply or event that named it, such as the id in a format reply or a selection_copied event. Zero or left out reads the newest result, whatever produced it. If the server no longer has the result, the call fails with not_found.",
+       "minimum": 0
+      },
+      "offset": {
+       "type": "integer",
+       "description": "Where to start reading, in bytes from the start of the result. To read the next part, add the length in bytes of the data you received. Must not be negative."
+      },
+      "max_bytes": {
+       "type": "integer",
+       "description": "The most bytes of data to return, measured once it is encoded as a JSON string. Zero or left out means 49152 (48 KiB), and values above 983040 (960 KiB) are lowered to that. Must not be negative."
+      }
+     },
+     "additionalProperties": false
+    },
+    "output_schema": {
+     "type": "object",
+     "properties": {
+      "id": {
+       "type": "integer",
+       "description": "The result that was read. Send it in later requests so that every part comes from the same result.",
+       "minimum": 0
+      },
+      "data": {
+       "type": "string",
+       "description": "The text read, starting at offset. It never ends partway through a character. It can be shorter than max_bytes even when more text remains."
+      },
+      "total": {
+       "type": "integer",
+       "description": "The length of the whole result, in bytes."
+      },
+      "eof": {
+       "type": "boolean",
+       "description": "True if data reaches the end of the result."
+      }
+     },
+     "required": [
+      "id",
+      "data",
+      "total",
+      "eof"
+     ],
+     "additionalProperties": false
+    }
+   },
+   "clear": {
+    "description": "Clear the screen and scrollback, keeping the current line at the top. It changes nothing while a full-screen program, such as an editor, is running.",
+    "input_schema": {
+     "type": "object",
+     "additionalProperties": false
+    },
+    "output_schema": {
+     "type": "object",
+     "additionalProperties": false
+    },
+    "actions": [
+     {
+      "name": "clear",
+      "title": "Clear Terminal",
+      "description": "Clear the screen and scrollback, keeping the current line.",
+      "category": "Pane",
+      "keywords": "terminal clear screen scrollback erase cmd+k ctrl+l"
+     }
+    ]
+   },
+   "clipboard_read": {
+    "description": "Read text that a program in the terminal copied to the clipboard. The server keeps each copy for about a minute, so a client can read text too large to send in an event.",
+    "input_schema": {
+     "type": "object",
+     "properties": {
+      "id": {
+       "type": "integer",
+       "description": "The copy to read, from a clipboard_written event or an earlier reply. Zero or left out reads the newest copy. If the server no longer has the copy, the call fails with not_found.",
+       "minimum": 0
+      },
+      "offset": {
+       "type": "integer",
+       "description": "Where to start reading, in bytes from the start of the text. To read the next part, add the length in bytes of the data you received. Must not be negative."
+      },
+      "max_bytes": {
+       "type": "integer",
+       "description": "The most bytes of data to return, measured once it is encoded as a JSON string. Zero or left out means 49152 (48 KiB), and values above 983040 (960 KiB) are lowered to that. Must not be negative."
+      }
+     },
+     "additionalProperties": false
+    },
+    "output_schema": {
+     "type": "object",
+     "properties": {
+      "id": {
+       "type": "integer",
+       "description": "The copy that was read. Send it in later requests so that every part comes from the same copy.",
+       "minimum": 0
+      },
+      "data": {
+       "type": "string",
+       "description": "The text read, starting at offset. It never ends partway through a character. It can be shorter than max_bytes even when more text remains."
+      },
+      "total": {
+       "type": "integer",
+       "description": "The length of the whole copied text, in bytes."
+      },
+      "eof": {
+       "type": "boolean",
+       "description": "True if data reaches the end of the text."
+      }
+     },
+     "required": [
+      "id",
+      "data",
+      "total",
+      "eof"
+     ],
+     "additionalProperties": false
+    }
+   },
    "download_begin": {
     "description": "Open a file on the terminal's machine for download, and get a ticket for the rex.data.bytes.v1 data stream that carries its bytes from the terminal. A relative path is relative to the working directory of the terminal's foreground process. Only regular files can be downloaded.",
     "input_schema": {
@@ -568,7 +805,7 @@
      "properties": {
       "ticket": {
        "type": "string",
-       "description": "A single-use ticket to send in the HELLO message that opens the data connection. Left out with not_modified."
+       "description": "A single-use ticket to send in the HELLO message that opens the data connection. Only a data connection from the same user can use it. Left out with not_modified."
       },
       "expires_in_ms": {
        "type": "integer",
@@ -578,7 +815,7 @@
       },
       "not_modified": {
        "type": "boolean",
-       "description": "The file still has the version named in if_none_match, so the client's copy is current."
+       "description": "The file still has the version named in if_none_match, so the client's copy is current. There is no ticket and nothing to download."
       },
       "path": {
        "type": "string",
@@ -590,15 +827,15 @@
       },
       "size": {
        "type": "integer",
-       "description": "The file's size in bytes when it was opened."
+       "description": "The file's size in bytes when it was opened, for showing progress only. The stream may carry more or fewer bytes if the file changes."
       },
       "modified_at": {
        "type": "string",
-       "description": "The file's modification time when it was opened, as an RFC 3339 timestamp."
+       "description": "The file's modification time when it was opened, as an RFC 3339 timestamp. Programs can set it to anything, so use version to tell whether the file changed."
       },
       "version": {
        "type": "string",
-       "description": "An opaque version string for caching."
+       "description": "An opaque string that changes whenever the file's contents may have, for caching. The same path with the same version has the same contents. Left out when the file changed within the last second, or when the server can't tell, and then the download must not be cached."
       }
      },
      "required": [
@@ -609,26 +846,6 @@
      ],
      "additionalProperties": false
     }
-   },
-   "clear": {
-    "description": "Clear the screen and scrollback, keeping the current line at the top. It changes nothing while a full-screen program, such as an editor, is running.",
-    "input_schema": {
-     "type": "object",
-     "additionalProperties": false
-    },
-    "output_schema": {
-     "type": "object",
-     "additionalProperties": false
-    },
-    "actions": [
-     {
-      "name": "clear",
-      "title": "Clear Terminal",
-      "description": "Clear the screen and scrollback, keeping the current line.",
-      "category": "Pane",
-      "keywords": "terminal clear screen scrollback erase cmd+k ctrl+l"
-     }
-    ]
    },
    "format": {
     "description": "Get the screen and scrollback as plain text, HTML, or escape sequences.",
@@ -807,6 +1024,188 @@
       "status",
       "entries",
       "truncated"
+     ],
+     "additionalProperties": false
+    }
+   },
+   "modes": {
+    "description": "List the terminal modes that programs can turn on, such as the alternate screen, bracketed paste, and mouse reporting, with each mode's name, number, and whether it is on. It doesn't wake an idle terminal.",
+    "input_schema": {
+     "type": "object",
+     "additionalProperties": false
+    },
+    "output_schema": {
+     "type": "object",
+     "properties": {
+      "screen": {
+       "type": "string",
+       "description": "Which screen the terminal shows: 'primary', or 'alternate' while a full-screen program such as an editor has switched to it with mode 47, 1047, or 1049. Treat any other value as 'primary'."
+      },
+      "modes": {
+       "type": [
+        "null",
+        "array"
+       ],
+       "items": {
+        "type": "object",
+        "properties": {
+         "name": {
+          "type": "string",
+          "description": "The mode's name, as Ghostty names it, such as 'bracketed_paste' or 'alt_screen_save_cursor_clear_enter'."
+         },
+         "number": {
+          "type": "integer",
+          "description": "The number a program sends to set or reset the mode, such as 2004 for bracketed paste.",
+          "minimum": 0,
+          "maximum": 65535
+         },
+         "ansi": {
+          "type": "boolean",
+          "description": "True for an ANSI mode, which a program sets with ESC [ number h. Left out for a DEC private mode, which a program sets with ESC [ ? number h. The two kinds are numbered separately, so the same number can name one mode of each kind."
+         },
+         "set": {
+          "type": "boolean",
+          "description": "True if the mode is on."
+         },
+         "default": {
+          "type": "boolean",
+          "description": "True if the mode is on in a new terminal and after a reset. Left out if it is off. A mode whose set differs from its default was changed by a program."
+         }
+        },
+        "required": [
+         "name",
+         "number",
+         "set"
+        ],
+        "additionalProperties": false
+       },
+       "description": "Every mode the terminal tracks, ANSI modes first, each group by number. Newer servers can add modes, so look modes up by name or number and skip any you don't know."
+      }
+     },
+     "required": [
+      "screen",
+      "modes"
+     ],
+     "additionalProperties": false
+    }
+   },
+   "ports": {
+    "description": "List the TCP ports that programs in the terminal are listening on, such as a development server's, with each port's address and the process that holds it. status is 'partial' when some processes couldn't be looked at, so a port missing from a partial reply may still be open. A truncated reply has an id, and blob_read with that id returns the whole list. It doesn't wake an idle terminal. To follow changes, call it once and then follow the ports_changed event.",
+    "input_schema": {
+     "type": "object",
+     "additionalProperties": false
+    },
+    "output_schema": {
+     "type": "object",
+     "properties": {
+      "status": {
+       "type": "string",
+       "description": "How complete ports is: 'ok' if every process in the terminal was looked at, 'partial' if some could not be, so ports may be missing some, or 'unsupported' if this server cannot list ports for this terminal. Treat any other value as 'partial'."
+      },
+      "ports": {
+       "type": "array",
+       "items": {
+        "type": "object",
+        "properties": {
+         "port": {
+          "type": "integer",
+          "description": "The port number.",
+          "minimum": 0,
+          "maximum": 65535
+         },
+         "address": {
+          "type": "string",
+          "description": "The address the socket is bound to, as an IP literal with no brackets, such as 127.0.0.1, ::1, 0.0.0.0, or ::. An IPv4 address mapped into IPv6 is given as plain IPv4. An IPv6 link-local address keeps its zone, an interface index, as in fe80::1%1."
+         },
+         "protocol": {
+          "type": "string",
+          "description": "The transport protocol, 'tcp' today. Skip an entry whose protocol you don't know."
+         },
+         "first_seen_at": {
+          "type": "string",
+          "description": "When the server first saw this address and port held by this process in this terminal, as an RFC 3339 timestamp. The server looks in the background, every second while there is output or input in any terminal and every 5 minutes at most while nothing happens, and also when asked, so this can be minutes after the port opened. It changes if the port closes and opens again or another process holds it.",
+          "format": "date-time"
+         },
+         "pid": {
+          "type": "integer",
+          "description": "The ID of the process that holds the socket, or the first started of several that share it. The process is described by the entry in processes with the same pid. Left out when the server can't tell which process holds the socket, such as a server started with sudo, and the reply is then partial."
+         }
+        },
+        "required": [
+         "port",
+         "address",
+         "protocol",
+         "first_seen_at"
+        ],
+        "additionalProperties": false
+       },
+       "description": "The ports that programs in the terminal listen on, sorted by port and then by address, with one entry for each protocol, address and port. An empty array when nothing is listening."
+      },
+      "processes": {
+       "type": "array",
+       "items": {
+        "type": "object",
+        "properties": {
+         "pid": {
+          "type": "integer",
+          "description": "The process ID."
+         },
+         "user_id": {
+          "type": "integer",
+          "description": "The user ID the process runs as on Unix, which shows when a command runs as another user, such as with sudo. Zero on Windows."
+         },
+         "user": {
+          "type": "string",
+          "description": "The name of the account the process runs as. Left out if it can't be looked up."
+         },
+         "name": {
+          "type": "string",
+          "description": "The file name of the executable, such as zsh. When path is left out, the system's own name for the process, which Linux limits to 15 bytes. To label a process, use the first of script, argv0, and name that is present."
+         },
+         "path": {
+          "type": "string",
+          "description": "The absolute path of the executable, with symlinks resolved. Left out if it can't be read, as for another user's process on Linux."
+         },
+         "invoked_path": {
+          "type": "string",
+          "description": "The absolute path the executable was started through, before symlinks were resolved, such as a link in a bin directory. Present only when Rex can confirm it leads to the same file as path."
+         },
+         "argv0": {
+          "type": "string",
+          "description": "The first argument as the process shows it now, such as -zsh for a login shell, cut to 256 bytes. Rex never returns the other arguments, because they can hold secrets."
+         },
+         "script": {
+          "type": "string",
+          "description": "For an interpreter such as node or python, the absolute path of the script it is running, as the user named it. Left out for other programs."
+         },
+         "cwd": {
+          "type": "string",
+          "description": "The process's working directory, as an absolute path. Left out if it can't be read, as for another user's process."
+         }
+        },
+        "required": [
+         "pid",
+         "user_id",
+         "name"
+        ],
+        "additionalProperties": false
+       },
+       "description": "The processes that hold the ports, sorted by pid, with one entry for each, described as the process method describes them. A pid in ports with no entry here is a process the server couldn't describe. Each is described when its first port is found, so fields such as cwd show their value from then."
+      },
+      "truncated": {
+       "type": "boolean",
+       "description": "True if entries were left out from the end of ports so that the reply fits in one message. processes then describes only the processes that the remaining entries name. Left out when false."
+      },
+      "id": {
+       "type": "integer",
+       "description": "Set only when truncated is true. Names a stored copy of the whole reply, from the same scan. Read it with blob_read from offset 0 until eof, and decode the text as a ports reply. The server keeps it for a few minutes. Left out if the server couldn't store the copy.",
+       "minimum": 0
+      }
+     },
+     "required": [
+      "status",
+      "ports",
+      "processes"
      ],
      "additionalProperties": false
     }

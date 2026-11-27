@@ -419,10 +419,10 @@ async fn rex_e2e_api_rev_11_upload_bytes_v1_and_grant_file_access() {
         other => panic!("unexpected {other:?}"),
     };
     assert_eq!(legacy_welcome["api_revision"], 7);
-    assert_eq!(legacy_welcome["api_server_revision"], 13);
+    assert_eq!(legacy_welcome["api_server_revision"], 21);
     drop(legacy);
 
-    // 2. Modern Rex.app client (rev 21..7) negotiates rev 13 over Unix socket.
+    // 2. Modern Rex.app client (rev 21..7) negotiates rev 21 over Unix socket.
     let mut ctrl = open_ws(srv.clone(), "/api/control", CONTROL_PROTOCOL, true).await;
     ctrl.send(Message::Text(
         json!({"type": "hello", "protocol": CONTROL_PROTOCOL, "api_revision": 21, "api_min_revision": 7})
@@ -435,7 +435,7 @@ async fn rex_e2e_api_rev_11_upload_bytes_v1_and_grant_file_access() {
         Message::Text(t) => serde_json::from_str(&t).unwrap(),
         other => panic!("unexpected {other:?}"),
     };
-    assert_eq!(welcome["api_revision"], 13);
+    assert_eq!(welcome["api_revision"], 21);
     let client_id = welcome["client"]["id"].as_str().unwrap().to_string();
     let client = srv.clients().into_iter().find(|c| c.id == client_id).unwrap();
     srv.attach(&client, &sid);
@@ -697,8 +697,123 @@ async fn rex_e2e_api_rev_11_upload_bytes_v1_and_grant_file_access() {
     assert_eq!(close_code, CLOSE_NORMAL);
     assert_eq!(received, dl_bytes);
 
+    // 10. Rev 3 modes, Rev 5 privacy_status, Rev 15 ports, Rev 18 event_dropped, Rev 19 focus_history.reverse, Rev 20 client.undo_close.
+    let modes = rpc(
+        &mut ctrl,
+        "m1",
+        "com.superlogical.terminal.modes",
+        json!({"session_id": sid, "block_id": bid, "args": {}}),
+    )
+    .await;
+    assert_eq!(modes["payload"]["screen"], "primary");
+    assert!(
+        modes["payload"]["modes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|m| m["name"] == "bracketed_paste" && m["set"] == true)
+    );
+
+    let ports = rpc(
+        &mut ctrl,
+        "p1",
+        "com.superlogical.terminal.ports",
+        json!({"session_id": sid, "block_id": bid, "args": {}}),
+    )
+    .await;
+    assert_eq!(ports["payload"]["status"], "ok");
+    assert!(ports["payload"]["ports"].is_array());
+
+    let priv_st = rpc(&mut ctrl, "pr1", "server.apple.privacy_status", json!({})).await;
+    assert!(priv_st["payload"]["services"].is_array());
+
+    let rev_empty = rpc(&mut ctrl, "fh1", "focus_history.reverse", json!({})).await;
+    assert_eq!(rev_empty["payload"]["reversed"], false);
+
+    let undo_empty = rpc(&mut ctrl, "uc1", "client.undo_close", json!({})).await;
+    assert_eq!(undo_empty["error"]["code"], CODE_NOT_FOUND);
+
+    // Rev 18: oversized event (>1 MiB) emits event_dropped and keeps connection open.
+    let huge = "x".repeat(MAX_MESSAGE_BYTES + 1024);
+    client.session_event(
+        &sid,
+        "block_event",
+        json!({
+            "block_id": bid,
+            "creator_name": TERMINAL_CREATOR,
+            "name": "selection_copied",
+            "payload": {"text": huge},
+        }),
+    );
+    let mut saw_dropped = false;
+    while let Some(Ok(Message::Text(txt))) = ctrl.next().await {
+        let v: Value = serde_json::from_str(&txt).unwrap();
+        if v["type"] == "event" && v["payload"]["type"] == "event_dropped" {
+            assert_eq!(v["payload"]["payload"]["event_type"], "block_event");
+            assert_eq!(v["payload"]["payload"]["session_id"], sid);
+            assert_eq!(v["payload"]["payload"]["block_id"], bid);
+            assert_eq!(v["payload"]["payload"]["block_event_name"], "selection_copied");
+            saw_dropped = true;
+            break;
+        }
+    }
+    assert!(saw_dropped, "oversized event must send event_dropped on rev >= 18");
+    // Connection is still alive after event_dropped!
+    let ping_after = rpc(&mut ctrl, "after_drop", "server.version", json!({})).await;
+    assert_eq!(ping_after["payload"]["api_revision"], 21);
+
     // Verify CloseCode conversion matches expected numeric constants.
     assert_eq!(u16::from(CloseCode::Normal), CLOSE_NORMAL);
 
     let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn transfer_tab_and_rev21_independent_zoom() {
+    let mut doc = Map::new();
+    doc_append_space(
+        &mut doc,
+        make_space("sp1", "one", "/tmp", vec![make_tab("tb1", "t1", make_block("p1", "t1")), make_tab("tb2", "t2", make_block("p2", "t2"))]),
+    );
+    doc_append_space(
+        &mut doc,
+        make_space("sp2", "two", "/tmp", vec![make_tab("tb3", "t3", make_block("p3", "t3"))]),
+    );
+    assert_eq!(doc_transfer_tab(&mut doc, "sp1", "tb1", "sp1", ""), Err("same_session"));
+    let moved = doc_transfer_tab(&mut doc, "sp1", "tb2", "sp2", "tb3").expect("transfer tb2");
+    assert_eq!(moved, vec!["t2".to_string()]);
+    let sp2_tabs = doc["spaces"][1]["tabs"].as_array().unwrap();
+    assert_eq!(sp2_tabs.len(), 2);
+    assert_eq!(sp2_tabs[0]["id"], "tb2");
+    assert_eq!(sp2_tabs[1]["id"], "tb3");
+
+    // Rev 21: tiled_zoomed_block_id stays set while focus is in an unzoomed floating layer.
+    let ids = Ids::new("/tmp/herdrex-zoom-test/core.sock");
+    let tab = Tab { id: "tb1".into(), workspace_id: "sp1".into(), label: "1".into(), focused: true };
+    let panes = vec![
+        Pane { id: "t1".into(), tab_id: "tb1".into(), workspace_id: "sp1".into(), ..Pane::default() },
+        Pane { id: "t2".into(), tab_id: "tb1".into(), workspace_id: "sp1".into(), ..Pane::default() },
+    ];
+    let floats = vec![super::model::FloatLayer {
+        layer_id: "layer:float1".into(),
+        pane_id: "t2".into(),
+        bounds: [0.1, 0.1, 0.8, 0.8],
+        minimized: false,
+    }];
+    let lay = LayoutNode {
+        kind: "split".into(),
+        direction: "right".into(),
+        ratio: 0.5,
+        first: Some(Box::new(LayoutNode::pane("t1".into()))),
+        second: Some(Box::new(LayoutNode::pane("t2".into()))),
+        focused: "t2".into(),
+        zoomed: false,
+        pane_id: String::new(),
+    };
+    let win = ids.window(&tab, &panes, &lay, &floats, Some("t1"), None);
+    assert_eq!(win.tiled_zoomed_block_id, Some(ids.rex("block", "t1")));
+    assert_eq!(win.zoomed_block_id, None);
+    let win_both = ids.window(&tab, &panes, &lay, &floats, Some("t1"), Some("t2"));
+    assert_eq!(win_both.tiled_zoomed_block_id, Some(ids.rex("block", "t1")));
+    assert_eq!(win_both.zoomed_block_id, Some(ids.rex("block", "t2")));
 }

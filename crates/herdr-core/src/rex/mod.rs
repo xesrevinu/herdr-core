@@ -240,16 +240,20 @@ fn register_all(srv: &RexServer, b: &Arc<RexBridge>) {
     reg(srv, b, "server.apple.grant_file_access", |_, c, p| async move {
         ops::h_grant_file_access(&c, &p).await
     });
+    reg(srv, b, "server.apple.privacy_status", |_, c, _| async move {
+        ops::h_privacy_status(&c).await
+    });
     reg(srv, b, "session.list", |b, _, _| async move { ops::h_list(&b).await });
     reg(srv, b, "session.view", |b, _, p| async move { ops::h_view(&b, &p).await });
     reg(srv, b, "session.attach", |b, c, p| async move { ops::h_attach(&b, &c, &p).await });
     reg(srv, b, "session.attach_all", |b, c, p| async move { ops::h_attach_all(&b, &c, &p).await });
     reg(srv, b, "session.bootstrap", |b, c, p| async move { ops::h_bootstrap(&b, &c, &p).await });
     reg(srv, b, "session.create", |b, c, p| async move { ops::h_create(&b, &c, &p).await });
-    reg(srv, b, "session.destroy", |b, _, p| async move { ops::h_destroy(&b, &p).await });
+    reg(srv, b, "session.destroy", |b, c, p| async move { ops::h_destroy(&b, &c, &p).await });
     reg(srv, b, "session.set_label", |b, _, p| async move { ops::h_set_label(&b, &p).await });
     reg(srv, b, "session.new_window", |b, c, p| async move { ops::h_new_window(&b, &c, &p).await });
-    reg(srv, b, "session.close_window", |b, _, p| async move { ops::h_close_window(&b, &p).await });
+    reg(srv, b, "session.close_window", |b, c, p| async move { ops::h_close_window(&b, &c, &p).await });
+    reg(srv, b, "session.transfer_window", |b, c, p| async move { ops::h_transfer_window(&b, &c, &p).await });
     reg(srv, b, "session.set_window_label", |b, _, p| async move { ops::h_rename_window(&b, &p).await });
     reg(srv, b, "session.focus_window", |b, _, p| async move { ops::h_focus_window(&b, &p).await });
     reg(srv, b, "session.new_block", |_, _, _| async move {
@@ -270,7 +274,7 @@ fn register_all(srv: &RexServer, b: &Arc<RexBridge>) {
     reg(srv, b, "session.resize_pane", |b, c, p| async move { ops::h_resize_pane(&b, &c, &p).await });
     reg(srv, b, "session.list_blocks", |b, _, p| async move { ops::h_list_blocks(&b, &p).await });
     reg(srv, b, "session.describe_block", |b, _, p| async move { ops::h_describe_block(&b, &p).await });
-    reg(srv, b, "block.close", |b, _, p| async move { ops::h_block_close(&b, &p).await });
+    reg(srv, b, "block.close", |b, c, p| async move { ops::h_block_close(&b, Some(&c), &p).await });
     reg(srv, b, "session.float_block", |b, c, p| async move { ops::h_float_block(&b, &c, &p).await });
     reg(srv, b, "session.resize_layer", |b, _, p| async move { ops::h_resize_layer(&b, &p).await });
     reg(srv, b, "session.raise_layer", |b, _, p| async move { ops::h_restack_layer(&b, &p, true).await });
@@ -300,6 +304,8 @@ fn register_all(srv: &RexServer, b: &Arc<RexBridge>) {
     reg(srv, b, "session.move_window", |b, _, p| async move { ops::h_move_window(&b, &p).await });
     reg(srv, b, "session.list_clients", |b, _, p| async move { ops::h_list_clients(&b, &p).await });
     reg(srv, b, "session.help", |b, _, p| async move { ops::h_session_help(&b, &p).await });
+    reg(srv, b, "focus_history.reverse", |b, c, p| async move { ops::h_focus_history_reverse(&b, &c, &p).await });
+    reg(srv, b, "client.undo_close", |b, c, _| async move { ops::h_undo_close(&b, &c).await });
 
     for &m in term::TERMINAL_METHODS {
         let full = format!("{TERMINAL_CREATOR}.{m}");

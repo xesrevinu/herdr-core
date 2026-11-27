@@ -11,7 +11,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 pub const CONTROL_PROTOCOL: &str = "rex.control.v1";
 pub const DATA_PROTOCOL: &str = "rex.data.terminal.v1";
 pub const DATA_BYTES_PROTOCOL: &str = "rex.data.bytes.v1";
-pub const API_REVISION: i64 = 13;
+pub const API_REVISION: i64 = 21;
 pub const API_MIN_REVISION: i64 = 7;
 pub const MAX_MESSAGE_BYTES: usize = 1 << 20;
 
