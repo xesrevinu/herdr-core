@@ -105,6 +105,21 @@ methods! { Ctx<'_>;
     "terminal.read" => terminal_read, ReadParams => ReadResult,
         "The screen plus `lines` of history as text, live or finished.",
         errors ["not_found", "machine_unknown"];
+    "terminal.paint" => terminal_paint, PaintParams => PaintResult,
+        "VT sequences that repaint the screen and `history` scrollback lines on a fresh viewer, with styles and the cursor. Soft wraps stay as display rows.",
+        errors ["not_found", "machine_unknown"];
+    "terminal.clear" => terminal_clear, TerminalParams => ClearResult,
+        "Clear the host emulator's screen and scrollback. Does not write to the program's PTY.",
+        errors ["not_found", "machine_unknown"];
+    "terminal.scroll" => terminal_scroll, ScrollParams => ScrollResult,
+        "Get or set how far the view sits above the live bottom. Omit offset_from_bottom to read it. The view is a window over stored scrollback; it does not send keys to a full-screen app.",
+        errors ["not_found", "machine_unknown"];
+    "terminal.unscroll" => terminal_unscroll, TerminalParams => ScrollResult,
+        "Move the view to the live bottom (offset_from_bottom 0). Same result as terminal.scroll.",
+        errors ["not_found", "machine_unknown"];
+    "terminal.selection_read" => terminal_selection_read, SelectionReadParams => SelectionReadResult,
+        "The plain text of an inclusive cell range. Rows are absolute: 0 is the oldest scrollback line, and the live screen starts at the max_offset_from_bottom from terminal.scroll.",
+        errors ["not_found", "machine_unknown"];
     "terminal.attach" => terminal_attach, AttachParams => AttachResult,
         "Open a raw stream to a live terminal on this framed connection (see `hello` with `framed`). Loss ends the stream even when kept; reattach after the restarted event.",
         errors ["not_found", "machine_unknown", "finished", "unavailable", "needs_framed"];
@@ -442,8 +457,192 @@ async fn terminal_read(core: Ctx<'_>, p: ReadParams) -> Result<ReadResult, RpcEr
             why: None,
         }
     };
+
     core.flush_observed().await?;
     Ok(result)
+}
+
+async fn terminal_paint(core: Ctx<'_>, p: PaintParams) -> Result<PaintResult, RpcError> {
+    let id = resolve(core, &p.terminal)?;
+    core.saw(p.caller.as_deref(), id);
+    let result = {
+        let st = core.lock();
+        match core.screen_paint(&st, id, p.history) {
+            Some((vt, cols, rows)) => PaintResult { vt: String::from_utf8_lossy(&vt).into_owned(), cols, rows },
+            None => PaintResult { vt: String::new(), cols: 80, rows: 24 },
+        }
+    };
+    core.flush_observed().await?;
+    Ok(result)
+}
+
+async fn terminal_clear(core: Ctx<'_>, p: TerminalParams) -> Result<ClearResult, RpcError> {
+    let id = resolve(core, &p.terminal)?;
+    core.saw(p.caller.as_deref(), id);
+    let ok = {
+        let mut st = core.lock();
+        core.screen_clear(&mut st, id)
+    };
+    core.flush_observed().await?;
+    Ok(ClearResult { ok })
+}
+
+fn scroll_state(st: &crate::runtime::State, id: u32) -> ScrollResult {
+    let hist = st.screens.get(&id).map(|s| s.history_rows()).unwrap_or(0);
+    let offset = st.scroll.get(&id).copied().unwrap_or(0).min(hist);
+    ScrollResult { offset_from_bottom: offset, max_offset_from_bottom: hist, view_top: hist.saturating_sub(offset) }
+}
+
+fn set_scroll(st: &mut crate::runtime::State, id: u32, offset: u32) -> ScrollResult {
+    let hist = st.screens.get(&id).map(|s| s.history_rows()).unwrap_or(0);
+    let offset = offset.min(hist);
+    if offset == 0 {
+        st.scroll.remove(&id);
+    } else {
+        st.scroll.insert(id, offset);
+    }
+    scroll_state(st, id)
+}
+
+/// Display cell width of a character (0 / 1 / 2). Combining marks and
+/// format characters are 0; East Asian wide/fullwidth and most emoji are 2.
+fn cell_cols(c: char) -> usize {
+    match c {
+        '\0' | '\u{7f}'..='\u{9f}' => 0,
+        c if (c as u32) < 0x20 => 0,
+        c if (c as u32) < 0x7f => 1,
+        '\u{200b}' | '\u{200c}' | '\u{200d}' | '\u{feff}' => 0,
+        '\u{fe00}'..='\u{fe0f}' => 0,
+        '\u{e0100}'..='\u{e01ef}' => 0,
+        c if unicode_zero_width(c) => 0,
+        c if unicode_wide(c) => 2,
+        _ => 1,
+    }
+}
+
+fn unicode_zero_width(c: char) -> bool {
+    matches!(c, '\u{0300}'..='\u{036f}' | '\u{0483}'..='\u{0489}' | '\u{07a6}'..='\u{07b0}' | '\u{135d}'..='\u{135f}' | '\u{1ab0}'..='\u{1ace}' | '\u{1dc0}'..='\u{1dff}' | '\u{20d0}'..='\u{20f0}' | '\u{2cef}'..='\u{2cf1}' | '\u{2d7f}' | '\u{2de0}'..='\u{2dff}' | '\u{302a}'..='\u{302f}' | '\u{3099}' | '\u{309a}' | '\u{a66f}'..='\u{a672}' | '\u{a674}'..='\u{a67d}' | '\u{a69e}' | '\u{a69f}' | '\u{a6f0}' | '\u{a6f1}' | '\u{a8e0}'..='\u{a8f1}' | '\u{fe20}'..='\u{fe2f}')
+        || matches!(c as u32, 0x1160..=0x11ff) // Hangul jamo medial/final
+}
+
+fn unicode_wide(c: char) -> bool {
+    matches!(c as u32,
+        0x1100..=0x115F
+            | 0x2329
+            | 0x232A
+            | 0x2E80..=0x303E
+            | 0x3040..=0xA4CF
+            | 0xAC00..=0xD7A3
+            | 0xF900..=0xFAFF
+            | 0xFE10..=0xFE19
+            | 0xFE30..=0xFE6F
+            | 0xFF00..=0xFF60
+            | 0xFFE0..=0xFFE6
+            | 0x1B000..=0x1B122
+            | 0x1F200..=0x1F2FF
+            | 0x1F300..=0x1F64F
+            | 0x1F680..=0x1F6FF
+            | 0x1F7E0..=0x1F7FF
+            | 0x1F900..=0x1F9FF
+            | 0x1FA70..=0x1FAFF
+            | 0x20000..=0x3FFFD
+    )
+}
+
+fn crop_line_cells(line: &str, start_col: usize, end_col: usize) -> String {
+    if end_col < start_col {
+        return String::new();
+    }
+    let mut out = String::new();
+    let mut col = 0usize;
+    let mut included = false;
+    for ch in line.chars() {
+        let w = cell_cols(ch);
+        if w == 0 {
+            if included {
+                out.push(ch);
+            }
+            continue;
+        }
+        if col > end_col {
+            break;
+        }
+        let keep = col + w > start_col && col <= end_col;
+        if keep {
+            out.push(ch);
+        }
+        included = keep;
+        col = col.saturating_add(w);
+    }
+    out
+}
+
+/// Crop an inclusive cell range from a terminal.read-style dump (row 0 is the first line).
+/// Columns are display cells, not grapheme or UTF-8 indices. A wide character is
+/// included if any of its cells is in the range.
+fn crop_text(text: &str, start_row: u32, start_col: u32, end_row: u32, end_col: u32) -> String {
+    let mut lines: Vec<&str> = text.trim_end_matches('\n').lines().collect();
+    if lines.last().is_some_and(|l| l.is_empty()) {
+        lines.pop();
+    }
+    let (mut fr, mut fc, mut tr, mut tc) = (start_row as usize, start_col as usize, end_row as usize, end_col as usize);
+    if (tr, tc) < (fr, fc) {
+        (fr, fc, tr, tc) = (tr, tc, fr, fc);
+    }
+    let mut out = String::new();
+    for r in fr..=tr {
+        if r >= lines.len() {
+            break;
+        }
+        let start = if r == fr { fc } else { 0 };
+        let end = if r == tr { tc } else { usize::MAX / 2 };
+        if r > fr {
+            out.push('\n');
+        }
+        out.push_str(&crop_line_cells(lines[r], start, end));
+    }
+    out
+}
+
+async fn terminal_scroll(core: Ctx<'_>, p: ScrollParams) -> Result<ScrollResult, RpcError> {
+    let id = resolve(core, &p.terminal)?;
+    core.saw(p.caller.as_deref(), id);
+    let result = {
+        let mut st = core.lock();
+        if let Some(offset) = p.offset_from_bottom {
+            set_scroll(&mut st, id, offset)
+        } else {
+            scroll_state(&st, id)
+        }
+    };
+    core.flush_observed().await?;
+    Ok(result)
+}
+
+async fn terminal_unscroll(core: Ctx<'_>, p: TerminalParams) -> Result<ScrollResult, RpcError> {
+    let id = resolve(core, &p.terminal)?;
+    core.saw(p.caller.as_deref(), id);
+    let result = {
+        let mut st = core.lock();
+        set_scroll(&mut st, id, 0)
+    };
+    core.flush_observed().await?;
+    Ok(result)
+}
+
+async fn terminal_selection_read(core: Ctx<'_>, p: SelectionReadParams) -> Result<SelectionReadResult, RpcError> {
+    let id = resolve(core, &p.terminal)?;
+    core.saw(p.caller.as_deref(), id);
+    let text = {
+        let st = core.lock();
+        if let Some(text) = core.screen_plain_range(&st, id, p.start_col as u16, p.start_row, p.end_col as u16, p.end_row) {
+            text
+        } else {
+            crop_text(&core.screen_text(&st, id).unwrap_or_default(), p.start_row, p.start_col, p.end_row, p.end_col)
+        }
+    };
+    core.flush_observed().await?;
+    Ok(SelectionReadResult { text })
 }
 
 async fn terminal_attach(core: Ctx<'_>, p: AttachParams) -> Result<AttachResult, RpcError> {
@@ -751,4 +950,24 @@ async fn machine_rm(core: Ctx<'_>, p: MachineParams) -> Result<RemoveResult, Rpc
 
 async fn rpc_discover(_: Ctx<'_>, _: Empty) -> Result<serde_json::Value, RpcError> {
     Ok(openrpc())
+}
+
+#[cfg(test)]
+mod crop_tests {
+    use super::{cell_cols, crop_text};
+
+    #[test]
+    fn wide_characters_are_two_cells() {
+        assert_eq!(cell_cols('你'), 2);
+        assert_eq!(cell_cols('a'), 1);
+        assert_eq!(cell_cols('\u{0301}'), 0);
+    }
+
+    #[test]
+    fn crop_text_uses_cell_columns() {
+        // 你(0-1) 好(2-3) 世(4-5) 界(6-7)
+        assert_eq!(crop_text("你好世界", 0, 2, 0, 5), "好世");
+        assert_eq!(crop_text("e\u{0301}x", 0, 0, 0, 0), "e\u{0301}");
+        assert_eq!(crop_text("hello", 0, 1, 0, 3), "ell");
+    }
 }

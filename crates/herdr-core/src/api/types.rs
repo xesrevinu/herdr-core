@@ -393,6 +393,85 @@ pub struct ReadResult {
 }
 
 #[derive(clap::Args, Serialize, Deserialize, JsonSchema)]
+pub struct PaintParams {
+    /// The terminal: `t7`, a name, or `machine/t7`.
+    #[arg(default_value = "", hide_default_value = true)]
+    pub terminal: String,
+    #[arg(skip)]
+    pub caller: Option<String>,
+    /// Scrollback lines above the screen to include (main screen only).
+    #[arg(long, default_value_t = 0)]
+    #[serde(default)]
+    pub history: usize,
+}
+
+#[derive(Serialize, JsonSchema)]
+pub struct PaintResult {
+    /// VT sequences that repaint the screen (and requested history) on a fresh viewer,
+    /// including styles and the cursor. Soft wraps stay display rows, unlike terminal.read.
+    pub vt: String,
+    pub cols: u16,
+    pub rows: u16,
+}
+
+#[derive(Serialize, JsonSchema)]
+pub struct ClearResult {
+    pub ok: bool,
+}
+
+#[derive(clap::Args, Serialize, Deserialize, JsonSchema)]
+pub struct ScrollParams {
+    /// The terminal: `t7`, a name, or `machine/t7`.
+    #[arg(default_value = "", hide_default_value = true)]
+    pub terminal: String,
+    #[arg(skip)]
+    pub caller: Option<String>,
+    /// How many rows above the live bottom the view should sit. Omit to
+    /// read the current view without moving it. Values past the stored
+    /// history are clamped.
+    #[arg(long)]
+    #[serde(default)]
+    pub offset_from_bottom: Option<u32>,
+}
+
+#[derive(Serialize, JsonSchema)]
+pub struct ScrollResult {
+    /// How many rows above the live bottom the view sits. Zero is the live screen.
+    pub offset_from_bottom: u32,
+    /// The farthest the view can sit above the live bottom (scrollback lines).
+    pub max_offset_from_bottom: u32,
+    /// Absolute row shown at the top of the view. Row 0 is the oldest
+    /// scrollback line; the live screen starts at max_offset_from_bottom.
+    pub view_top: u32,
+}
+
+#[derive(clap::Args, Serialize, Deserialize, JsonSchema)]
+pub struct SelectionReadParams {
+    /// The terminal: `t7`, a name, or `machine/t7`.
+    #[arg(default_value = "", hide_default_value = true)]
+    pub terminal: String,
+    #[arg(skip)]
+    pub caller: Option<String>,
+    /// Absolute start row (0 is the oldest scrollback line).
+    #[arg(long)]
+    pub start_row: u32,
+    /// Start column (0 is the first cell).
+    #[arg(long)]
+    pub start_col: u32,
+    /// Absolute end row, inclusive.
+    #[arg(long)]
+    pub end_row: u32,
+    /// End column, inclusive.
+    #[arg(long)]
+    pub end_col: u32,
+}
+
+#[derive(Serialize, JsonSchema)]
+pub struct SelectionReadResult {
+    pub text: String,
+}
+
+#[derive(clap::Args, Serialize, Deserialize, JsonSchema)]
 pub struct AttachParams {
     /// The terminal: `t7`, a name, or `machine/t7`.
     #[arg(default_value = "", hide_default_value = true)]

@@ -50,6 +50,9 @@ pub struct State {
     pub reg: Registry,
     pub docs: std::collections::BTreeMap<String, crate::api::DocGetResult>,
     pub screens: HashMap<u32, Screen>,
+    /// How far each terminal's view sits above the live bottom, in rows.
+    /// Zero (or missing) means the view follows the live screen.
+    pub scroll: HashMap<u32, u32>,
     pub relays: HashMap<u32, Relay>,
     /// One deadline per terminal; image streams replace it instead of spawning timers.
     pub image_deadlines: HashMap<u32, (u64, tokio::time::Instant)>,
@@ -856,6 +859,50 @@ impl Core {
                 .and_then(|bytes| Screen::restore(&bytes, self.history_bytes()))
                 .map(|s| s.plain_text()),
         }
+    }
+
+    /// VT that repaints a live or finished terminal, with styles and the cursor.
+    pub fn screen_paint(&self, st: &State, id: u32, history: usize) -> Option<(Vec<u8>, u16, u16)> {
+        let paint = |s: &Screen| {
+            let (cols, rows) = s.size();
+            (s.paint(history), cols, rows)
+        };
+        if let Some(screen) = st.screens.get(&id) {
+            return Some(paint(screen));
+        }
+        std::fs::read(self.snapshot_path(id))
+            .ok()
+            .and_then(|bytes| Screen::restore(&bytes, self.history_bytes()))
+            .map(|s| paint(&s))
+    }
+
+    /// Cell-accurate selection, restoring a finished snapshot when needed.
+    pub fn screen_plain_range(
+        &self,
+        st: &State,
+        id: u32,
+        start_col: u16,
+        start_row: u32,
+        end_col: u16,
+        end_row: u32,
+    ) -> Option<String> {
+        if let Some(screen) = st.screens.get(&id) {
+            return Some(screen.plain_range(start_col, start_row, end_col, end_row));
+        }
+        std::fs::read(self.snapshot_path(id))
+            .ok()
+            .and_then(|bytes| Screen::restore(&bytes, self.history_bytes()))
+            .map(|s| s.plain_range(start_col, start_row, end_col, end_row))
+    }
+
+    /// Clear the host emulator's screen and scrollback. Does not write to the PTY.
+    pub fn screen_clear(&self, st: &mut State, id: u32) -> bool {
+        let Some(screen) = st.screens.get_mut(&id) else {
+            return false;
+        };
+        screen.write(b"\x1b[H\x1b[2J\x1b[3J");
+        st.scroll.remove(&id);
+        true
     }
 
     pub fn remove(&self, st: &mut State, id: u32) {

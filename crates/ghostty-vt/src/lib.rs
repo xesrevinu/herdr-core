@@ -641,10 +641,44 @@ impl Terminal {
         (unsafe { ffi::ghostty_terminal_grid_ref(self.raw, point, &mut out) } == ffi::SUCCESS).then_some(out)
     }
 
-    fn history_rows(&self) -> u32 {
+    /// Scrollback lines above the active screen.
+    pub fn history_rows(&self) -> u32 {
         let mut bar = ffi::Scrollbar::default();
         unsafe { ffi::ghostty_terminal_get(self.raw, ffi::DATA_SCROLLBAR, (&raw mut bar).cast()) };
         bar.total.saturating_sub(self.size().1 as u64) as u32
+    }
+
+    fn point_for(&self, col: u16, row: u32) -> Option<(i32, u16, u32)> {
+        let hist = self.history_rows();
+        if row < hist {
+            Some((ffi::POINT_HISTORY, col, row))
+        } else {
+            Some((ffi::POINT_ACTIVE, col, row - hist))
+        }
+    }
+
+    /// Plain text of an inclusive cell range. Row 0 is the oldest scrollback
+    /// line; the live screen starts at `history_rows()`.
+    pub fn plain_range(&self, start_col: u16, start_row: u32, end_col: u16, end_row: u32) -> String {
+        let Some((t0, x0, y0)) = self.point_for(start_col, start_row) else {
+            return String::new();
+        };
+        let Some((t1, x1, y1)) = self.point_for(end_col, end_row) else {
+            return String::new();
+        };
+        let Some(start) = self.grid_ref(t0, x0, y0) else {
+            return String::new();
+        };
+        let Some(end) = self.grid_ref(t1, x1, y1) else {
+            return String::new();
+        };
+        let sel = ffi::Selection {
+            size: size_of::<ffi::Selection>(),
+            start,
+            end,
+            rectangle: false,
+        };
+        String::from_utf8_lossy(&self.format(ffi::FORMAT_PLAIN, Some(&sel), false)).into_owned()
     }
 
     fn format(&self, emit: i32, selection: Option<&ffi::Selection>, extras: bool) -> Vec<u8> {
