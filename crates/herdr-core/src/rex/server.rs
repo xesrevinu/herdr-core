@@ -292,6 +292,14 @@ impl DataStream {
         Ok(())
     }
 
+    #[allow(clippy::result_unit_err)]
+    pub async fn send_half_close(&self) -> Result<(), ()> {
+        if *self.closed_rx.borrow() {
+            return Err(());
+        }
+        self.tx.send(DataCmd::Bytes(Vec::new())).await.map_err(|_| ())
+    }
+
     pub async fn close(&self, code: u16, reason: &str) {
         let _ = self.tx.send(DataCmd::Close(code, reason.to_string())).await;
     }
@@ -606,6 +614,21 @@ impl RexServer {
             subprotocol: sub.to_string(),
         };
         self.new_ticket(c, req, None, Some(upload), sub)
+    }
+
+    pub fn issue_download_ticket(
+        &self,
+        c: Arc<RexClient>,
+        sub: &str,
+        serve: DataServeFn,
+    ) -> DataTicket {
+        let req = DataRequest {
+            session_id: String::new(),
+            block_id: String::new(),
+            data_ref_id: String::new(),
+            subprotocol: sub.to_string(),
+        };
+        self.new_ticket(c, req, Some(serve), None, sub)
     }
 
     fn new_ticket(

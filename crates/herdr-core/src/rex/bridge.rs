@@ -154,6 +154,7 @@ pub struct RexBridge {
     kick: Notify,
 
     pub st: Mutex<BridgeState>,
+    pub listeners: Mutex<Vec<Value>>,
     pub hub_mu: tokio::sync::Mutex<()>,
     pub hubs: Mutex<HashMap<String, Arc<Hub>>>,
     pub uploads: Mutex<HashMap<String, Arc<UploadBatch>>>,
@@ -186,10 +187,15 @@ impl RexBridge {
             req: Mutex::new(PendingRefresh::default()),
             kick: Notify::new(),
             st: Mutex::new(BridgeState::default()),
+            listeners: Mutex::new(Vec::new()),
             hub_mu: tokio::sync::Mutex::new(()),
             hubs: Mutex::new(HashMap::new()),
             uploads: Mutex::new(HashMap::new()),
         })
+    }
+
+    pub fn set_listeners(&self, list: Vec<Value>) {
+        *self.listeners.lock().unwrap_or_else(|p| p.into_inner()) = list;
     }
 
     pub fn since(&self) -> Duration {

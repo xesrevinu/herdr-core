@@ -43,7 +43,8 @@ impl RexBridge {
             let st = self.st.lock().unwrap_or_else(|p| p.into_inner());
             (st.sigs.len(), st.keymap_gen.max(1), st.keymap_hash.clone())
         };
-        json!({
+        let listeners = self.listeners.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        let mut out = json!({
             "pid": std::process::id(),
             "instance_id": self.instance,
             "host_id": self.ids.host_id,
@@ -54,7 +55,11 @@ impl RexBridge {
             "api_min_revision": API_MIN_REVISION,
             "tailscale": {"state": "disabled", "allow_tailnet_members": false},
             "config": {"generation": kgen, "hash": khash},
-        })
+        });
+        if !listeners.is_empty() {
+            out["listeners"] = Value::Array(listeners);
+        }
+        out
     }
 
     pub async fn sessions(&self) -> Vec<Value> {

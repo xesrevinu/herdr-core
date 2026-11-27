@@ -90,8 +90,9 @@ pub(crate) async fn maybe_start(core: Arc<Core>) -> io::Result<Option<RexGuard>>
 
     let mut tasks = bridge.start_background();
     let mut unix_paths = Vec::new();
+    let mut listeners = Vec::new();
 
-    for spec in specs {
+    for (idx, spec) in specs.iter().copied().enumerate() {
         if let Some(raw_path) = spec.strip_prefix("unix://").or_else(|| spec.strip_prefix("unix:")) {
             #[cfg(unix)]
             {
@@ -103,6 +104,16 @@ pub(crate) async fn maybe_start(core: Arc<Core>) -> io::Result<Option<RexGuard>>
                 let _ = std::fs::remove_file(&path);
                 let listener = tokio::net::UnixListener::bind(&path)?;
                 let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+                let mut item = serde_json::json!({
+                    "endpoint": format!("unix://{raw_path}"),
+                    "addresses": [raw_path],
+                    "transport": "unix",
+                    "admission": "peer_credentials",
+                });
+                if idx == 0 {
+                    item["primary"] = serde_json::json!(true);
+                }
+                listeners.push(item);
                 unix_paths.push(path);
                 let s = srv.clone();
                 tasks.push(
@@ -136,6 +147,16 @@ pub(crate) async fn maybe_start(core: Arc<Core>) -> io::Result<Option<RexGuard>>
         } else {
             let listener = TcpListener::bind(spec).await?;
             let bound = listener.local_addr().map(|a| a.to_string()).unwrap_or_else(|_| spec.to_string());
+            let mut item = serde_json::json!({
+                "endpoint": spec,
+                "addresses": [bound],
+                "transport": "tcp",
+                "admission": "anonymous",
+            });
+            if idx == 0 {
+                item["primary"] = serde_json::json!(true);
+            }
+            listeners.push(item);
             let s = srv.clone();
             tasks.push(
                 tokio::spawn(async move {
@@ -161,6 +182,7 @@ pub(crate) async fn maybe_start(core: Arc<Core>) -> io::Result<Option<RexGuard>>
             eprintln!("core: rex host listening on {bound}");
         }
     }
+    bridge.set_listeners(listeners);
 
     Ok(Some(RexGuard { tasks, unix_paths }))
 }

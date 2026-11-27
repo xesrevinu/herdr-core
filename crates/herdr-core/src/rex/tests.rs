@@ -419,10 +419,10 @@ async fn rex_e2e_api_rev_11_upload_bytes_v1_and_grant_file_access() {
         other => panic!("unexpected {other:?}"),
     };
     assert_eq!(legacy_welcome["api_revision"], 7);
-    assert_eq!(legacy_welcome["api_server_revision"], 11);
+    assert_eq!(legacy_welcome["api_server_revision"], 13);
     drop(legacy);
 
-    // 2. Modern Rex.app client (rev 21..7) negotiates rev 11 over Unix socket.
+    // 2. Modern Rex.app client (rev 21..7) negotiates rev 13 over Unix socket.
     let mut ctrl = open_ws(srv.clone(), "/api/control", CONTROL_PROTOCOL, true).await;
     ctrl.send(Message::Text(
         json!({"type": "hello", "protocol": CONTROL_PROTOCOL, "api_revision": 21, "api_min_revision": 7})
@@ -435,7 +435,7 @@ async fn rex_e2e_api_rev_11_upload_bytes_v1_and_grant_file_access() {
         Message::Text(t) => serde_json::from_str(&t).unwrap(),
         other => panic!("unexpected {other:?}"),
     };
-    assert_eq!(welcome["api_revision"], 11);
+    assert_eq!(welcome["api_revision"], 13);
     let client_id = welcome["client"]["id"].as_str().unwrap().to_string();
     let client = srv.clients().into_iter().find(|c| c.id == client_id).unwrap();
     srv.attach(&client, &sid);
@@ -624,6 +624,78 @@ async fn rex_e2e_api_rev_11_upload_bytes_v1_and_grant_file_access() {
     assert_eq!(send_bytes_stream(srv.clone(), tk_b0, &[b"111"], true).await, CLOSE_NORMAL);
     assert_eq!(std::fs::read(root.join("files").join(&pane_addr).join("first.png")).unwrap(), b"111");
     assert_eq!(std::fs::read(root.join("files").join(&pane_addr).join("second.png")).unwrap(), b"222");
+
+    // 9. download_begin (Rev 13): local regular file, 0-byte file, missing/dir errors, if_none_match.
+    let dl_file = root.join("demos.mbt");
+    let dl_bytes = b"fn main() { println(\"hello rex\") }\n";
+    std::fs::write(&dl_file, dl_bytes).unwrap();
+    let dl_err_missing = rpc(
+        &mut ctrl,
+        "dl_miss",
+        "com.superlogical.terminal.download_begin",
+        json!({
+            "session_id": sid,
+            "block_id": bid,
+            "args": {"ref": "download:77777777-7777-7777-7777-777777777777", "path": root.join("nope.mbt").to_string_lossy()},
+        }),
+    )
+    .await;
+    assert_eq!(dl_err_missing["error"]["code"], CODE_NOT_FOUND);
+
+    let dl_err_dir = rpc(
+        &mut ctrl,
+        "dl_dir",
+        "com.superlogical.terminal.download_begin",
+        json!({
+            "session_id": sid,
+            "block_id": bid,
+            "args": {"ref": "download:88888888-8888-8888-8888-888888888888", "path": root.to_string_lossy()},
+        }),
+    )
+    .await;
+    assert_eq!(dl_err_dir["error"]["code"], CODE_BAD_REQUEST);
+
+    let dl_ok = rpc(
+        &mut ctrl,
+        "dl1",
+        "com.superlogical.terminal.download_begin",
+        json!({
+            "session_id": sid,
+            "block_id": bid,
+            "args": {"ref": "download:99999999-9999-9999-9999-999999999999", "path": dl_file.to_string_lossy()},
+        }),
+    )
+    .await;
+    assert_eq!(dl_ok["payload"]["name"], "demos.mbt");
+    assert_eq!(dl_ok["payload"]["size"], dl_bytes.len());
+    let dl_tk = dl_ok["payload"]["ticket"].as_str().unwrap();
+    let mut ds = open_ws(srv.clone(), "/api/data", DATA_BYTES_PROTOCOL, true).await;
+    let raw_tk = URL_SAFE_NO_PAD.decode(dl_tk).unwrap();
+    let mut hello = Vec::with_capacity(17);
+    hello.push(MSG_HELLO);
+    hello.extend_from_slice(&raw_tk);
+    ds.send(Message::Binary(hello.into())).await.unwrap();
+    let wel = ds.next().await.unwrap().unwrap();
+    assert!(matches!(wel, Message::Binary(ref b) if b.len() == 32 && b[0] == MSG_WELCOME));
+    let mut received = Vec::new();
+    let mut saw_half_close = false;
+    let mut close_code = 0u16;
+    while let Some(item) = ds.next().await {
+        match item.unwrap() {
+            Message::Binary(b) if b.is_empty() => {
+                saw_half_close = true;
+            }
+            Message::Binary(b) => received.extend_from_slice(&b),
+            Message::Close(Some(cf)) => {
+                close_code = cf.code.into();
+                break;
+            }
+            _ => {}
+        }
+    }
+    assert!(saw_half_close, "download stream must send empty binary half-close frame");
+    assert_eq!(close_code, CLOSE_NORMAL);
+    assert_eq!(received, dl_bytes);
 
     // Verify CloseCode conversion matches expected numeric constants.
     assert_eq!(u16::from(CloseCode::Normal), CLOSE_NORMAL);

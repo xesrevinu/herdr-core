@@ -539,6 +539,77 @@
    }
   },
   "methods": {
+   "download_begin": {
+    "description": "Open a file on the terminal's machine for download, and get a ticket for the rex.data.bytes.v1 data stream that carries its bytes from the terminal. A relative path is relative to the working directory of the terminal's foreground process. Only regular files can be downloaded.",
+    "input_schema": {
+     "type": "object",
+     "properties": {
+      "ref": {
+       "type": "string",
+       "description": "The data reference for the file's stream: download: followed by a new UUID in lower-case canonical form, which the client chooses."
+      },
+      "path": {
+       "type": "string",
+       "description": "The file to download. A relative path is relative to the working directory of the terminal's foreground process, and a leading ~ is the home directory."
+      },
+      "if_none_match": {
+       "type": "string",
+       "description": "The version of the copy the client already has, from an earlier result for the same path. If the file still has it, the result has not_modified and no ticket."
+      }
+     },
+     "required": [
+      "ref",
+      "path"
+     ],
+     "additionalProperties": false
+    },
+    "output_schema": {
+     "type": "object",
+     "properties": {
+      "ticket": {
+       "type": "string",
+       "description": "A single-use ticket to send in the HELLO message that opens the data connection. Left out with not_modified."
+      },
+      "expires_in_ms": {
+       "type": "integer",
+       "description": "How long the ticket stays valid after the server issues it, in milliseconds. Left out with not_modified.",
+       "minimum": 0,
+       "maximum": 4294967295
+      },
+      "not_modified": {
+       "type": "boolean",
+       "description": "The file still has the version named in if_none_match, so the client's copy is current."
+      },
+      "path": {
+       "type": "string",
+       "description": "The absolute path of the file, with symlinks left as they are."
+      },
+      "name": {
+       "type": "string",
+       "description": "The file's name: the last element of path."
+      },
+      "size": {
+       "type": "integer",
+       "description": "The file's size in bytes when it was opened."
+      },
+      "modified_at": {
+       "type": "string",
+       "description": "The file's modification time when it was opened, as an RFC 3339 timestamp."
+      },
+      "version": {
+       "type": "string",
+       "description": "An opaque version string for caching."
+      }
+     },
+     "required": [
+      "path",
+      "name",
+      "size",
+      "modified_at"
+     ],
+     "additionalProperties": false
+    }
+   },
    "clear": {
     "description": "Clear the screen and scrollback, keeping the current line at the top. It changes nothing while a full-screen program, such as an editor, is running.",
     "input_schema": {

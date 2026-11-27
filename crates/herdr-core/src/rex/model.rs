@@ -90,8 +90,9 @@ impl Ids {
     pub fn new(host_path: &str) -> Self {
         let ns = Uuid::parse_str(NS_STR).expect("valid static uuid");
         let host = Uuid::new_v5(&ns, format!("host/{host_path}").as_bytes());
+        let host_id = read_local_rex_host_id().unwrap_or_else(|| host.to_string());
         Self {
-            host_id: host.to_string(),
+            host_id,
             host,
             rev: RwLock::new(HashMap::new()),
         }
@@ -252,4 +253,44 @@ pub fn pane_label(p: &Pane) -> String {
         return p.terminal_title.clone();
     }
     p.id.clone()
+}
+
+/// Reads the local Rex server's `host-id` so Rex.app recognizes local panes on
+/// this machine as sharing the same filesystem (direct file link open + local
+/// Finder file paste), while remote panes use distinct per-machine UUIDv5 IDs.
+fn read_local_rex_host_id() -> Option<String> {
+    let mut candidates = Vec::new();
+    if let Ok(home) = std::env::var("HOME")
+        && !home.is_empty()
+    {
+        #[cfg(target_os = "macos")]
+        candidates.push(
+            std::path::PathBuf::from(&home)
+                .join("Library")
+                .join("Application Support")
+                .join("rex")
+                .join("host-id"),
+        );
+        if let Ok(xdg) = std::env::var("XDG_STATE_HOME")
+            && !xdg.is_empty()
+        {
+            candidates.push(std::path::PathBuf::from(xdg).join("rex").join("host-id"));
+        }
+        candidates.push(
+            std::path::PathBuf::from(&home)
+                .join(".local")
+                .join("state")
+                .join("rex")
+                .join("host-id"),
+        );
+    }
+    for path in candidates {
+        if let Ok(raw) = std::fs::read_to_string(&path) {
+            let trimmed = raw.trim();
+            if Uuid::parse_str(trimmed).is_ok() {
+                return Some(trimmed.to_string());
+            }
+        }
+    }
+    None
 }

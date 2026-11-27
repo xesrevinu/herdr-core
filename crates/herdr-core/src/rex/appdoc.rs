@@ -184,40 +184,48 @@ pub struct TermStatus {
     pub progress: Option<u8>,
 }
 
+fn null_default<'de, D, T>(d: D) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Default + Deserialize<'de>,
+{
+    Ok(Option::<T>::deserialize(d)?.unwrap_or_default())
+}
+
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct TermForeground {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     pub name: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     pub cwd: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     pub pid: i64,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     pub argv: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct TerminalRec {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     pub address: String,
     pub name: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     pub title: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     pub cwd: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     pub cols: i32,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     pub rows: i32,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     pub state: String,
     pub status: Option<TermStatus>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     pub records: HashMap<String, TermStatus>,
     pub status_ms: Option<u64>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     pub pid: i64,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     pub argv: Vec<String>,
     pub foreground: Option<TermForeground>,
 }

@@ -14,7 +14,7 @@ use super::hub::{
 };
 use super::ops::{num_arg, obj_arg, str_arg};
 use super::proto::*;
-use super::server::{RexClient, UploadChunk, UploadServeFn, UploadStream};
+use super::server::{DataServeFn, RexClient, UploadChunk, UploadServeFn, UploadStream};
 use crate::server::call_internal;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as B64;
@@ -38,6 +38,7 @@ pub const TERMINAL_METHODS: &[&str] = &[
     "clear",
     "reset",
     "upload_begin",
+    "download_begin",
     "list_dir",
     "blob_read",
     "clipboard_read",
@@ -216,6 +217,7 @@ pub async fn h_block_method(
         }
         "process" => b.term_process(&pane).await,
         "upload_begin" => b.upload_begin(c, p, &pane).await,
+        "download_begin" => b.download_begin(c, p, &pane).await,
         "program_status" => {
             let x = b.pane(&pane).await?;
             Ok(json!({"records": b.status_records(&x)}))
@@ -923,6 +925,245 @@ impl RexBridge {
         });
         let tk = self.srv.issue_upload_ticket(c.clone(), DATA_BYTES_PROTOCOL, serve);
         Ok(json!({"ticket": tk.ticket, "expires_in_ms": tk.expires_in_ms}))
+    }
+
+    pub async fn download_begin(
+        self: &Arc<Self>,
+        c: &Arc<RexClient>,
+        p: &Value,
+        pane: &str,
+    ) -> Result<Value, RexError> {
+        let sid = str_arg(p, "session_id");
+        if !c.attached(sid) {
+            return Err(RexError::conflict("connection is not attached to this session"));
+        }
+        let empty = json!({});
+        let args = obj_arg(p, "args").unwrap_or(&empty);
+        let r#ref = str_arg(args, "ref");
+        let Some(raw_uuid) = r#ref.strip_prefix("download:") else {
+            return Err(RexError::bad_request("ref must start with download:"));
+        };
+        if let Err(e) = Uuid::parse_str(raw_uuid) {
+            return Err(RexError::bad_request(format!("ref must hold a UUID: {e}")));
+        }
+        let raw_path = str_arg(args, "path");
+        if raw_path.is_empty() {
+            return Err(RexError::bad_request("path is required"));
+        }
+        let if_none_match = str_arg(args, "if_none_match");
+        let pane_rec = self.pane(pane).await?;
+        let cwd = pwd_of(&pane_rec).to_string();
+        let on = machine_of(pane).to_string();
+        if !on.is_empty() {
+            return self.download_begin_remote(c, &on, &cwd, raw_path, if_none_match).await;
+        }
+        let home = self.local_home();
+        let abs = resolve_list_path(raw_path, &cwd, &home);
+        let meta = std::fs::metadata(&abs).map_err(|e| download_io_err(&abs, &e))?;
+        if !meta.is_file() {
+            let kind = if meta.is_dir() { "is a directory" } else { "is not a regular file" };
+            return Err(RexError::bad_request(format!("not a regular file: {abs} {kind}")));
+        }
+        let file = std::fs::File::open(&abs).map_err(|e| download_io_err(&abs, &e))?;
+        let fmeta = file.metadata().map_err(|e| download_io_err(&abs, &e))?;
+        let size = fmeta.len();
+        let mtime = fmeta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+        let modified_at = stamp_rfc3339(mtime);
+        let version = file_version(&fmeta, mtime);
+        let name = Path::new(&abs)
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or(&abs)
+            .to_string();
+        let mut out = Map::new();
+        out.insert("path".into(), Value::String(abs));
+        out.insert("name".into(), Value::String(name));
+        out.insert("size".into(), json!(size));
+        out.insert("modified_at".into(), Value::String(modified_at));
+        if let Some(ver) = &version {
+            out.insert("version".into(), Value::String(ver.clone()));
+            if !if_none_match.is_empty() && ver == if_none_match {
+                out.insert("not_modified".into(), Value::Bool(true));
+                return Ok(Value::Object(out));
+            }
+        }
+        let serve: DataServeFn = Box::new(move |st| {
+            Box::pin(async move {
+                use std::io::Read;
+                let mut f = file;
+                loop {
+                    let (f_back, res) = tokio::task::spawn_blocking(move || {
+                        let mut buf = vec![0u8; MAX_DATA_FRAME];
+                        let r = f.read(&mut buf);
+                        (f, r.map(|n| {
+                            buf.truncate(n);
+                            buf
+                        }))
+                    })
+                    .await
+                    .unwrap_or_else(|e| {
+                        panic!("download reader task panicked: {e}");
+                    });
+                    f = f_back;
+                    match res {
+                        Ok(chunk) if chunk.is_empty() => {
+                            let _ = st.send_half_close().await;
+                            st.close(CLOSE_NORMAL, "").await;
+                            return;
+                        }
+                        Ok(chunk) => {
+                            if st.send(&chunk).await.is_err() {
+                                return;
+                            }
+                        }
+                        Err(_) => {
+                            st.close(CLOSE_PROVIDER_FAILED, "data provider failed").await;
+                            return;
+                        }
+                    }
+                }
+            })
+        });
+        let tk = self.srv.issue_download_ticket(c.clone(), DATA_BYTES_PROTOCOL, serve);
+        out.insert("ticket".into(), Value::String(tk.ticket));
+        out.insert("expires_in_ms".into(), json!(tk.expires_in_ms));
+        Ok(Value::Object(out))
+    }
+
+    async fn download_begin_remote(
+        self: &Arc<Self>,
+        c: &Arc<RexClient>,
+        on: &str,
+        cwd: &str,
+        raw_path: &str,
+        if_none_match: &str,
+    ) -> Result<Value, RexError> {
+        const STAT_PY: &str = r#"
+import os, json, sys, time, datetime
+path, cwd = sys.argv[1], sys.argv[2]
+home = os.path.expanduser("~")
+p = (path or "").strip()
+if p == "~": p = home
+elif p.startswith("~/"): p = os.path.join(home, p[2:])
+if not os.path.isabs(p): p = os.path.join(cwd or os.getcwd(), p)
+abs_path = os.path.normpath(p)
+try:
+    st = os.stat(abs_path)
+except FileNotFoundError:
+    print(json.dumps({"err": "not_found", "msg": f"not found: {abs_path} does not exist"})); raise SystemExit
+except PermissionError:
+    print(json.dumps({"err": "forbidden", "msg": f"permission denied: {abs_path}"})); raise SystemExit
+except OSError as e:
+    print(json.dumps({"err": "bad_request", "msg": str(e)})); raise SystemExit
+import stat
+if not stat.S_ISREG(st.st_mode):
+    kind = "is a directory" if stat.S_ISDIR(st.st_mode) else "is not a regular file"
+    print(json.dumps({"err": "bad_request", "msg": f"not a regular file: {abs_path} {kind}"})); raise SystemExit
+mt = datetime.datetime.fromtimestamp(st.st_mtime, tz=datetime.timezone.utc).isoformat().replace("+00:00", "Z")
+ver = None
+if time.time() - st.st_mtime >= 1.0:
+    ver = f"{st.st_dev}:{st.st_ino}:{st.st_size}:{st.st_mtime_ns}"
+print(json.dumps({"path": abs_path, "name": os.path.basename(abs_path) or abs_path, "size": st.st_size, "modified_at": mt, "version": ver}))
+"#;
+        let mut info: Option<Value> = None;
+        let mut py_bin = "python3";
+        for py in ["python3", "python"] {
+            let mut params = Map::new();
+            params.insert("argv".into(), json!([py, "-c", STAT_PY, raw_path, cwd]));
+            params.insert("on".into(), Value::String(on.to_string()));
+            if !cwd.is_empty() {
+                params.insert("cwd".into(), Value::String(cwd.to_string()));
+            }
+            params.insert("timeout".into(), json!(10.0));
+            if let Ok(res) = call_internal(&self.core, None, "machine.exec", Value::Object(params)).await
+                && res["code"].as_i64() == Some(0)
+                && let Some(b64) = res["stdout"].as_str()
+                && let Ok(raw) = B64.decode(b64)
+                && let Ok(v) = serde_json::from_slice::<Value>(&raw)
+            {
+                py_bin = py;
+                info = Some(v);
+                break;
+            }
+        }
+        let Some(v) = info else {
+            return Err(RexError::internal(format!("could not stat {raw_path} on {on}")));
+        };
+        if let Some(err_kind) = v["err"].as_str() {
+            let msg = v["msg"].as_str().unwrap_or("download failed").to_string();
+            return Err(match err_kind {
+                "not_found" => RexError::not_found(msg),
+                "forbidden" => RexError::new("forbidden", msg, 403),
+                _ => RexError::bad_request(msg),
+            });
+        }
+        let abs = v["path"].as_str().unwrap_or_default().to_string();
+        let name = v["name"].as_str().unwrap_or_default().to_string();
+        let size = v["size"].as_u64().unwrap_or(0);
+        let modified_at = v["modified_at"].as_str().unwrap_or_default().to_string();
+        let version = v["version"].as_str().map(String::from);
+
+        let mut out = Map::new();
+        out.insert("path".into(), Value::String(abs.clone()));
+        out.insert("name".into(), Value::String(name));
+        out.insert("size".into(), json!(size));
+        out.insert("modified_at".into(), Value::String(modified_at));
+        if let Some(ver) = &version {
+            out.insert("version".into(), Value::String(ver.clone()));
+            if !if_none_match.is_empty() && ver == if_none_match {
+                out.insert("not_modified".into(), Value::Bool(true));
+                return Ok(Value::Object(out));
+            }
+        }
+
+        let core = self.core.clone();
+        let machine = on.to_string();
+        let py = py_bin.to_string();
+        let serve: DataServeFn = Box::new(move |st| {
+            Box::pin(async move {
+                const CHUNK_PY: &str = "import sys; f=open(sys.argv[1],'rb'); f.seek(int(sys.argv[2])); sys.stdout.buffer.write(f.read(int(sys.argv[3])))";
+                const REMOTE_CHUNK: usize = 4 << 20;
+                let mut offset: u64 = 0;
+                loop {
+                    let params = json!({
+                        "on": machine,
+                        "argv": [py, "-c", CHUNK_PY, abs, offset.to_string(), REMOTE_CHUNK.to_string()],
+                        "timeout": 30.0,
+                    });
+                    let res = match call_internal(&core, None, "machine.exec", params).await {
+                        Ok(r) if r["code"].as_i64() == Some(0) => r,
+                        _ => {
+                            st.close(CLOSE_PROVIDER_FAILED, "data provider failed").await;
+                            return;
+                        }
+                    };
+                    let b64 = res["stdout"].as_str().unwrap_or_default();
+                    let Ok(bytes) = B64.decode(b64) else {
+                        st.close(CLOSE_PROVIDER_FAILED, "data provider failed").await;
+                        return;
+                    };
+                    if bytes.is_empty() {
+                        let _ = st.send_half_close().await;
+                        st.close(CLOSE_NORMAL, "").await;
+                        return;
+                    }
+                    let got_len = bytes.len();
+                    if st.send(&bytes).await.is_err() {
+                        return;
+                    }
+                    offset += got_len as u64;
+                    if got_len < REMOTE_CHUNK {
+                        let _ = st.send_half_close().await;
+                        st.close(CLOSE_NORMAL, "").await;
+                        return;
+                    }
+                }
+            })
+        });
+        let tk = self.srv.issue_download_ticket(c.clone(), DATA_BYTES_PROTOCOL, serve);
+        out.insert("ticket".into(), Value::String(tk.ticket));
+        out.insert("expires_in_ms".into(), json!(tk.expires_in_ms));
+        Ok(Value::Object(out))
     }
 
     async fn receive_upload(
@@ -1658,6 +1899,34 @@ fn list_dir_status(e: &std::io::Error) -> &'static str {
                 "denied"
             }
         }
+    }
+}
+
+fn download_io_err(path: &str, e: &std::io::Error) -> RexError {
+    match e.kind() {
+        std::io::ErrorKind::NotFound => RexError::not_found(format!("not found: {path} does not exist")),
+        std::io::ErrorKind::PermissionDenied => RexError::new("forbidden", format!("permission denied: {path}"), 403),
+        _ => RexError::bad_request(format!("{path}: {e}")),
+    }
+}
+
+fn file_version(meta: &std::fs::Metadata, mtime: SystemTime) -> Option<String> {
+    let age = SystemTime::now().duration_since(mtime).ok()?;
+    if age < std::time::Duration::from_secs(1) {
+        return None;
+    }
+    let mtime_ns = mtime
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map_or(0, |d| d.as_nanos());
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Some(format!("{}:{}:{}:{mtime_ns}", meta.dev(), meta.ino(), meta.len()))
+    }
+    #[cfg(not(unix))]
+    {
+        Some(format!("{}:{mtime_ns}", meta.len()))
     }
 }
 
