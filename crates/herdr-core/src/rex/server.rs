@@ -130,6 +130,10 @@ impl RexClient {
         self.state.lock().unwrap_or_else(|p| p.into_inner()).info.clone()
     }
 
+    pub fn is_unix(&self) -> bool {
+        self.principal.get("transport").and_then(Value::as_str) == Some("unix")
+    }
+
     pub fn remember_session(&self, sid: &str) {
         if sid.is_empty() {
             return;
@@ -305,17 +309,23 @@ impl DataStream {
     }
 }
 
+pub enum UploadChunk {
+    Data(Vec<u8>),
+    HalfClose,
+    Dropped,
+}
+
 pub struct UploadStream {
     pub client: Arc<RexClient>,
     pub request: DataRequest,
     pub nonce: u64,
-    rx: mpsc::Receiver<Option<Vec<u8>>>,
+    rx: mpsc::Receiver<UploadChunk>,
     close_tx: mpsc::Sender<(u16, String)>,
 }
 
 impl UploadStream {
-    pub async fn recv(&mut self) -> Option<Vec<u8>> {
-        self.rx.recv().await.flatten()
+    pub async fn recv(&mut self) -> UploadChunk {
+        self.rx.recv().await.unwrap_or(UploadChunk::Dropped)
     }
 
     pub async fn close(&self, code: u16, reason: &str) {
@@ -1029,35 +1039,51 @@ impl RexServer {
         }
 
         if let Some(upload_fn) = tk.upload {
-            let (in_tx, in_rx) = mpsc::channel::<Option<Vec<u8>>>(16);
+            let (in_tx, in_rx) = mpsc::channel::<UploadChunk>(16);
             let (close_tx, mut close_rx) = mpsc::channel::<(u16, String)>(4);
             let reader = tokio::spawn(async move {
+                let mut sent_end = false;
                 while let Some(item) = ws_rx.next().await {
                     match item {
+                        Ok(Message::Binary(b)) if b.is_empty() => {
+                            let _ = in_tx.send(UploadChunk::HalfClose).await;
+                            sent_end = true;
+                            break;
+                        }
                         Ok(Message::Binary(b)) => {
-                            if in_tx.send(Some(b.to_vec())).await.is_err() {
+                            if in_tx.send(UploadChunk::Data(b.to_vec())).await.is_err() {
+                                sent_end = true;
                                 break;
                             }
                         }
-                        Ok(Message::Text(t)) => {
-                            if in_tx.send(Some(t.as_bytes().to_vec())).await.is_err() {
-                                break;
-                            }
+                        Ok(Message::Close(Some(cf))) if cf.code == CloseCode::Normal => {
+                            let _ = in_tx.send(UploadChunk::HalfClose).await;
+                            sent_end = true;
+                            break;
                         }
                         Ok(Message::Ping(_)) | Ok(Message::Pong(_)) => {}
-                        _ => break,
+                        _ => {
+                            let _ = in_tx.send(UploadChunk::Dropped).await;
+                            sent_end = true;
+                            break;
+                        }
                     }
                 }
-                let _ = in_tx.send(None).await;
+                if !sent_end {
+                    let _ = in_tx.send(UploadChunk::Dropped).await;
+                }
             });
             let closer = tokio::spawn(async move {
                 if let Some((code, reason)) = close_rx.recv().await {
-                    let _ = ws_tx
-                        .send(Message::Close(Some(CloseFrame {
+                    let _ = tokio::time::timeout(
+                        CONTROL_WRITE_TIMEOUT,
+                        ws_tx.send(Message::Close(Some(CloseFrame {
                             code: CloseCode::from(code),
                             reason: reason.into(),
-                        })))
-                        .await;
+                        }))),
+                    )
+                    .await;
+                    let _ = tokio::time::timeout(CONTROL_WRITE_TIMEOUT, ws_tx.flush()).await;
                 }
             });
             let st = UploadStream {

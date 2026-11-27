@@ -193,6 +193,9 @@ struct HubInner {
     paste: bool,
     pty_pending: Vec<u8>,
     osc52: Vec<u8>,
+    /// Lightweight zero-scrollback VT mirror for remote panes (local panes
+    /// read `core.lock().screens` directly). Tracks DEC modes & Kitty keyboard.
+    remote_vt: Option<ghostty_vt::Terminal>,
 }
 
 pub struct Hub {
@@ -220,7 +223,54 @@ impl Hub {
     }
 
     pub fn wants_paste(&self) -> bool {
-        self.inner.lock().unwrap_or_else(|p| p.into_inner()).paste
+        let fallback = {
+            let inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+            if let Some(vt) = inner.remote_vt.as_ref() {
+                return vt.dec_mode(2004);
+            }
+            inner.paste
+        };
+        if let Some(id) = crate::terminals::parse_id(&self.pane) {
+            let st = self.bridge.core.lock();
+            if let Some(screen) = st.screens.get(&id) {
+                return screen.dec_mode(2004);
+            }
+        }
+        fallback
+    }
+
+    pub fn encode_key_event(&self, ev: &super::term::RexKeyEvent) -> Option<Vec<u8>> {
+        {
+            let inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+            if let Some(vt) = inner.remote_vt.as_ref() {
+                return Some(vt.encode_key_event(
+                    ev.action,
+                    ev.key,
+                    ev.mods,
+                    ev.consumed_mods,
+                    ev.composing,
+                    &ev.text,
+                    ev.unshifted,
+                    ev.option_as_alt,
+                ));
+            }
+        }
+        if let Some(id) = crate::terminals::parse_id(&self.pane) {
+            let st = self.bridge.core.lock();
+            if let Some(screen) = st.screens.get(&id) {
+                return Some(screen.encode_key_event(
+                    ev.action,
+                    ev.key,
+                    ev.mods,
+                    ev.consumed_mods,
+                    ev.composing,
+                    &ev.text,
+                    ev.unshifted,
+                    ev.option_as_alt,
+                ));
+            }
+        }
+        None
     }
 
     pub fn write_input(&self, data: &[u8]) {
@@ -313,6 +363,9 @@ impl Hub {
         let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         inner.size.cols = cols;
         inner.size.rows = rows;
+        if let Some(vt) = inner.remote_vt.as_mut() {
+            vt.resize(cols, rows);
+        }
     }
 
     fn apply_pty_note(&self, note: PtyNote) {
@@ -422,6 +475,10 @@ impl Hub {
                         }
                         let (filtered, note, clips) = {
                             let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+                            if let Some(vt) = inner.remote_vt.as_mut() {
+                                vt.write(payload);
+                                let _ = vt.take_responses();
+                            }
                             let pending = std::mem::take(&mut inner.pty_pending);
                             let (filtered, rest, note) = feed_pty_modes(&pending, payload);
                             inner.pty_pending = rest;
@@ -614,6 +671,8 @@ impl RexBridge {
         let s = Sub::new(false);
         let mut subs = HashMap::new();
         subs.insert(s.id, s.clone());
+        let remote_vt = (!super::appdoc::machine_of(pane).is_empty())
+            .then(|| ghostty_vt::Terminal::new(size.cols.max(1), size.rows.max(1), 0));
         let h = Arc::new(Hub {
             bridge: self.clone(),
             pane: pane.to_string(),
@@ -631,6 +690,7 @@ impl RexBridge {
                 paste: false,
                 pty_pending: Vec::new(),
                 osc52: Vec::new(),
+                remote_vt,
             }),
         });
         self.hubs.lock().unwrap_or_else(|p| p.into_inner()).insert(pane.to_string(), h.clone());

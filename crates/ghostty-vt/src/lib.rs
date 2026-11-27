@@ -249,6 +249,8 @@ mod ffi {
         pub fn ghostty_key_event_set_action(ev: KeyEvent, action: i32);
         pub fn ghostty_key_event_set_key(ev: KeyEvent, key: i32);
         pub fn ghostty_key_event_set_mods(ev: KeyEvent, mods: u16);
+        pub fn ghostty_key_event_set_consumed_mods(ev: KeyEvent, mods: u16);
+        pub fn ghostty_key_event_set_composing(ev: KeyEvent, composing: bool);
         pub fn ghostty_key_event_set_utf8(ev: KeyEvent, utf8: *const u8, len: usize);
         pub fn ghostty_key_event_set_unshifted_codepoint(ev: KeyEvent, cp: u32);
         pub fn ghostty_mouse_encoder_new(alloc: *const c_void, out: *mut MouseEncoder) -> i32;
@@ -485,6 +487,49 @@ impl Terminal {
             ffi::ghostty_key_event_set_action(ev, 1);
             ffi::ghostty_key_event_set_key(ev, key);
             ffi::ghostty_key_event_set_mods(ev, mods);
+            ffi::ghostty_key_event_set_utf8(ev, text.as_ptr(), text.len());
+            ffi::ghostty_key_event_set_unshifted_codepoint(ev, unshifted);
+            let mut buf = [0u8; 128];
+            let mut len = 0usize;
+            let rc = ffi::ghostty_key_encoder_encode(enc, ev, buf.as_mut_ptr(), buf.len(), &mut len);
+            ffi::ghostty_key_event_free(ev);
+            ffi::ghostty_key_encoder_free(enc);
+            if rc == ffi::SUCCESS { buf[..len].to_vec() } else { Vec::new() }
+        }
+    }
+
+    /// Encodes a full W3C/Ghostty key event (`action`: 0=release, 1=press,
+    /// 2=repeat) using the terminal's live keyboard modes (Kitty keyboard
+    /// protocol, modifyOtherKeys, DECCKM, DECKPAM, alt-esc-prefix).
+    #[allow(clippy::too_many_arguments)]
+    pub fn encode_key_event(
+        &self,
+        action: i32,
+        key: i32,
+        mods: u16,
+        consumed_mods: u16,
+        composing: bool,
+        text: &str,
+        unshifted: u32,
+        option_as_alt: bool,
+    ) -> Vec<u8> {
+        let (mut enc, mut ev) = (ptr::null_mut(), ptr::null_mut());
+        unsafe {
+            if ffi::ghostty_key_encoder_new(ptr::null(), &mut enc) != ffi::SUCCESS {
+                return Vec::new();
+            }
+            if ffi::ghostty_key_event_new(ptr::null(), &mut ev) != ffi::SUCCESS {
+                ffi::ghostty_key_encoder_free(enc);
+                return Vec::new();
+            }
+            ffi::ghostty_key_encoder_setopt_from_terminal(enc, self.raw);
+            let opt: i32 = i32::from(option_as_alt);
+            ffi::ghostty_key_encoder_setopt(enc, 6, (&raw const opt).cast());
+            ffi::ghostty_key_event_set_action(ev, action);
+            ffi::ghostty_key_event_set_key(ev, key);
+            ffi::ghostty_key_event_set_mods(ev, mods);
+            ffi::ghostty_key_event_set_consumed_mods(ev, consumed_mods);
+            ffi::ghostty_key_event_set_composing(ev, composing);
             ffi::ghostty_key_event_set_utf8(ev, text.as_ptr(), text.len());
             ffi::ghostty_key_event_set_unshifted_codepoint(ev, unshifted);
             let mut buf = [0u8; 128];

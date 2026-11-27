@@ -123,13 +123,21 @@ impl Ids {
         v
     }
 
+    pub fn host_id_for(&self, machine: &str) -> String {
+        if machine.is_empty() {
+            self.host_id.clone()
+        } else {
+            Uuid::new_v5(&self.host, format!("machine/{machine}").as_bytes()).to_string()
+        }
+    }
+
     pub fn block(&self, p: &Pane) -> RexBlock {
         RexBlock {
             block_id: self.rex("block", &p.id),
             label: pane_label(p),
             creator_name: TERMINAL_CREATOR.into(),
             flavor: SHELL_FLAVOR.into(),
-            host_id: self.host_id.clone(),
+            host_id: self.host_id_for(super::appdoc::machine_of(&p.id)),
             owner: String::new(),
         }
     }

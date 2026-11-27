@@ -636,6 +636,9 @@ impl RexBridge {
                     continue;
                 }
                 for layer in &win.layers {
+                    if layer.state == "minimized" {
+                        continue;
+                    }
                     for blk in &layer.blocks {
                         if let Some(z) = &win.zoomed_block_id
                             && blk.block_id != *z
@@ -748,6 +751,85 @@ pub async fn h_version() -> Result<Value, RexError> {
         "api_revision": API_REVISION,
         "api_min_revision": API_MIN_REVISION,
     }))
+}
+
+pub async fn h_grant_file_access(c: &RexClient, p: &Value) -> Result<Value, RexError> {
+    const MAX_FILES: usize = 256;
+    if !c.is_unix() {
+        return Err(RexError::new(
+            "forbidden",
+            "server.apple.grant_file_access is only allowed over a local Unix socket",
+            403,
+        ));
+    }
+    let Some(raw) = p.get("files") else {
+        return Err(RexError::bad_request("files is required"));
+    };
+    let items = if raw.is_null() {
+        &[][..]
+    } else if let Some(arr) = raw.as_array() {
+        arr.as_slice()
+    } else {
+        return Err(RexError::bad_request("files must be an array"));
+    };
+    if items.len() > MAX_FILES {
+        return Err(RexError::bad_request(format!("at most {MAX_FILES} files per request")));
+    }
+    let mut out = Vec::with_capacity(items.len());
+    for item in items {
+        let Some(obj) = item.as_object() else {
+            return Err(RexError::bad_request("each entry in files must be an object"));
+        };
+        let path = obj.get("path").and_then(Value::as_str).unwrap_or_default();
+        let token = obj.get("token").and_then(Value::as_str).unwrap_or_default();
+        if !std::path::Path::new(path).is_absolute() {
+            out.push(json!({
+                "path": path,
+                "access": "denied",
+                "message": "the path is not absolute",
+            }));
+            continue;
+        }
+        match std::fs::File::open(path) {
+            Ok(_) => {
+                out.push(json!({"path": path, "access": "readable"}));
+            }
+            Err(first_err) => {
+                if !token.is_empty() && consume_sandbox_token(token) && std::fs::File::open(path).is_ok() {
+                    out.push(json!({"path": path, "access": "granted"}));
+                } else {
+                    let msg = if token.is_empty() {
+                        format!("open {path}: {first_err}, and the request has no token")
+                    } else {
+                        format!("open {path}: {first_err}")
+                    };
+                    out.push(json!({
+                        "path": path,
+                        "access": "denied",
+                        "message": msg,
+                    }));
+                }
+            }
+        }
+    }
+    Ok(json!({"files": out}))
+}
+
+#[cfg(target_os = "macos")]
+fn consume_sandbox_token(token: &str) -> bool {
+    use std::ffi::CString;
+    unsafe extern "C" {
+        fn sandbox_extension_consume(extension_token: *const std::ffi::c_char) -> i64;
+    }
+    let Ok(ctok) = CString::new(token) else {
+        return false;
+    };
+    unsafe { sandbox_extension_consume(ctok.as_ptr()) >= 0 }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn consume_sandbox_token(_token: &str) -> bool {
+    false
 }
 
 pub async fn h_list(b: &RexBridge) -> Result<Value, RexError> {

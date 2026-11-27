@@ -14,7 +14,7 @@ use super::hub::{
 };
 use super::ops::{num_arg, obj_arg, str_arg};
 use super::proto::*;
-use super::server::{RexClient, UploadServeFn, UploadStream};
+use super::server::{RexClient, UploadChunk, UploadServeFn, UploadStream};
 use crate::server::call_internal;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as B64;
@@ -323,20 +323,30 @@ pub async fn h_client_key(b: &RexBridge, _c: &RexClient, p: &Value) -> Result<Va
 // =========================================================================
 
 impl RexBridge {
-    pub async fn paste_input(&self, pane: &str, text: &str) -> Result<(), RexError> {
+    fn terminal_wants_paste(&self, pane: &str) -> bool {
         if let Some(h) = self.hub(pane) {
-            if h.wants_paste() {
-                let mut buf = Vec::with_capacity(PASTE_START.len() + text.len() + PASTE_END.len());
-                buf.extend_from_slice(PASTE_START.as_bytes());
-                buf.extend_from_slice(text.as_bytes());
-                buf.extend_from_slice(PASTE_END.as_bytes());
-                h.write_input(&buf);
-            } else {
-                h.write_input(text.as_bytes());
+            return h.wants_paste();
+        }
+        if machine_of(pane).is_empty()
+            && let Some(id) = crate::terminals::parse_id(pane)
+        {
+            let st = self.core.lock();
+            if let Some(screen) = st.screens.get(&id) {
+                return screen.dec_mode(2004);
             }
+        }
+        false
+    }
+
+    pub async fn paste_input(&self, pane: &str, text: &str) -> Result<(), RexError> {
+        let bytes = crate::input::paste(self.terminal_wants_paste(pane), text);
+        if let Some(h) = self.hub(pane)
+            && h.control
+        {
+            h.write_input(&bytes);
             return Ok(());
         }
-        self.inject_bytes(pane, text.as_bytes()).await
+        self.inject_bytes(pane, &bytes).await
     }
 
     pub fn focus_event(&self, pane: &str, p: &Value) -> Result<(), RexError> {
@@ -367,7 +377,48 @@ impl RexBridge {
         Ok(String::new())
     }
 
+    fn encode_terminal_key(&self, pane: &str, ev: &RexKeyEvent) -> Option<Vec<u8>> {
+        if let Some(h) = self.hub(pane)
+            && let Some(bytes) = h.encode_key_event(ev)
+        {
+            return Some(bytes);
+        }
+        if machine_of(pane).is_empty()
+            && let Some(id) = crate::terminals::parse_id(pane)
+        {
+            let st = self.core.lock();
+            if let Some(screen) = st.screens.get(&id) {
+                return Some(screen.encode_key_event(
+                    ev.action,
+                    ev.key,
+                    ev.mods,
+                    ev.consumed_mods,
+                    ev.composing,
+                    &ev.text,
+                    ev.unshifted,
+                    ev.option_as_alt,
+                ));
+            }
+        }
+        None
+    }
+
     pub async fn send_key(&self, pane: &str, k: &Value) -> Result<(), RexError> {
+        if let Some(ev) = parse_rex_key_event(k)
+            && let Some(raw) = self.encode_terminal_key(pane, &ev)
+        {
+            if raw.is_empty() {
+                return Ok(());
+            }
+            self.unscroll(pane).await;
+            if let Some(h) = self.hub(pane)
+                && h.control
+            {
+                h.write_input(&raw);
+                return Ok(());
+            }
+            return self.inject_bytes(pane, &raw).await;
+        }
         if k.get("composing").and_then(Value::as_bool).unwrap_or(false)
             || str_arg(k, "action") == "release"
         {
@@ -885,37 +936,57 @@ impl RexBridge {
         let mut cancel_rx = u.cancel_tx.subscribe();
         let mut got = Vec::with_capacity(expected_size.min(64 << 10));
 
-        while got.len() < expected_size {
+        loop {
             let chunk = tokio::select! {
                 _ = cancel_rx.changed() => {
-                    st.close(1001, "the upload was dropped").await;
+                    st.close(CLOSE_PROVIDER_CANCELED, "the upload was dropped").await;
                     return;
                 }
                 msg = st.recv() => msg,
             };
-            let Some(msg) = chunk else {
-                self.abort_upload(&u, &name, &format!("the stream ended with {} of {expected_size} bytes", got.len()));
-                return;
-            };
-            if got.len() + msg.len() > expected_size {
-                st.close(1008, "more bytes than the reserved size").await;
-                self.abort_upload(&u, &name, &format!("more than {expected_size} bytes"));
-                return;
+            match chunk {
+                UploadChunk::Data(msg) => {
+                    if got.len() + msg.len() > expected_size {
+                        st.close(CLOSE_PROTOCOL_VIOLATION, "data stream broke a rule").await;
+                        self.abort_upload(&u, &name, &format!("more than {expected_size} bytes"));
+                        return;
+                    }
+                    if !self.touch_upload(&u) {
+                        st.close(CLOSE_PROVIDER_CANCELED, "the upload expired").await;
+                        self.abort_upload(&u, &name, "no bytes for upload idle timeout");
+                        return;
+                    }
+                    got.extend_from_slice(&msg);
+                }
+                UploadChunk::HalfClose => {
+                    if got.len() != expected_size {
+                        st.close(CLOSE_PROTOCOL_VIOLATION, "data stream broke a rule").await;
+                        self.abort_upload(
+                            &u,
+                            &name,
+                            &format!("the stream ended with {} of {expected_size} bytes", got.len()),
+                        );
+                        return;
+                    }
+                    break;
+                }
+                UploadChunk::Dropped => {
+                    self.abort_upload(
+                        &u,
+                        &name,
+                        &format!("the stream ended with {} of {expected_size} bytes", got.len()),
+                    );
+                    return;
+                }
             }
-            if !self.touch_upload(&u) {
-                st.close(1001, "the upload expired").await;
-                self.abort_upload(&u, &name, "no bytes for upload idle timeout");
-                return;
-            }
-            got.extend_from_slice(&msg);
         }
 
         if *u.cancel_tx.borrow() {
-            st.close(1001, "the upload was dropped").await;
+            st.close(CLOSE_PROVIDER_CANCELED, "the upload was dropped").await;
             return;
         }
         if got.len() > MAX_CORE_PUT {
-            st.close(1011, "could not store the file").await;
+            st.close(CLOSE_PROVIDER_FAILED, "could not store the file").await;
             self.abort_upload(&u, &name, "exceeds terminal.put limit");
             return;
         }
@@ -970,10 +1041,12 @@ impl RexBridge {
         };
 
         if let Some(paths) = all_paths {
-            let text = paths.join(" ");
+            let text = format!("{} ", paths.join(" "));
             self.unscroll(&u.pane).await;
             if let Err(e) = self.paste_input(&u.pane, &text).await {
                 eprintln!("rex upload: typing the paths: {e}");
+                st.close(CLOSE_PROVIDER_FAILED, "could not type the paths").await;
+                return;
             }
         }
         st.close(CLOSE_NORMAL, "").await;
@@ -1011,6 +1084,302 @@ pub fn pasted(data: &str) -> Option<&str> {
     let rest = data.strip_prefix(PASTE_START)?;
     let (text, after) = rest.split_once(PASTE_END)?;
     after.is_empty().then_some(text)
+}
+
+pub struct RexKeyEvent {
+    pub action: i32,
+    pub key: i32,
+    pub mods: u16,
+    pub consumed_mods: u16,
+    pub composing: bool,
+    pub text: String,
+    pub unshifted: u32,
+    pub option_as_alt: bool,
+}
+
+pub fn parse_rex_key_event(k: &Value) -> Option<RexKeyEvent> {
+    let action = match str_arg(k, "action") {
+        "" | "press" => 1,
+        "release" => 0,
+        "repeat" => 2,
+        _ => return None,
+    };
+    let name = str_arg(k, "key");
+    let key = rex_ghostty_key(name);
+    let mods = rex_ghostty_mods(str_arg(k, "mods"));
+    let consumed_mods = rex_ghostty_mods(str_arg(k, "consumed_mods"));
+    let composing = k.get("composing").and_then(Value::as_bool).unwrap_or(false);
+    let raw_text = str_arg(k, "text");
+    // Some synthetic callers pass raw C0 control bytes in `text` for Ctrl+key.
+    // Ghostty's key encoder expects printable UTF-8 text or empty string for Ctrl chords.
+    let text = if (mods & (1 << 1)) != 0
+        && raw_text.len() == 1
+        && raw_text.as_bytes()[0] < 0x20
+    {
+        String::new()
+    } else {
+        raw_text.to_string()
+    };
+    let unshifted = k
+        .get("unshifted_codepoint")
+        .and_then(Value::as_u64)
+        .filter(|&cp| cp > 0 && cp <= u32::MAX as u64)
+        .map(|cp| cp as u32)
+        .unwrap_or_else(|| default_unshifted_codepoint(name));
+    let option_as_alt = (consumed_mods & (1 << 2)) == 0;
+    Some(RexKeyEvent {
+        action,
+        key,
+        mods,
+        consumed_mods,
+        composing,
+        text,
+        unshifted,
+        option_as_alt,
+    })
+}
+
+pub fn encode_rex_key_with_screen(screen: &ghostty_vt::Terminal, k: &Value) -> Vec<u8> {
+    let Some(ev) = parse_rex_key_event(k) else {
+        return Vec::new();
+    };
+    screen.encode_key_event(
+        ev.action,
+        ev.key,
+        ev.mods,
+        ev.consumed_mods,
+        ev.composing,
+        &ev.text,
+        ev.unshifted,
+        ev.option_as_alt,
+    )
+}
+
+fn rex_ghostty_mods(s: &str) -> u16 {
+    let mut m = 0u16;
+    for part in s.split('+') {
+        match part {
+            "shift" => m |= 1 << 0,
+            "ctrl" => m |= 1 << 1,
+            "alt" => m |= 1 << 2,
+            "super" => m |= 1 << 3,
+            "caps_lock" => m |= 1 << 4,
+            "num_lock" => m |= 1 << 5,
+            "shift_side" => m |= 1 << 6,
+            "ctrl_side" => m |= 1 << 7,
+            "alt_side" => m |= 1 << 8,
+            "super_side" => m |= 1 << 9,
+            _ => {}
+        }
+    }
+    m
+}
+
+fn default_unshifted_codepoint(name: &str) -> u32 {
+    if let Some(ch) = name.strip_prefix("key_").filter(|s| s.len() == 1) {
+        return ch.as_bytes()[0].to_ascii_lowercase() as u32;
+    }
+    if let Some(ch) = name.strip_prefix("digit_").filter(|s| s.len() == 1) {
+        return ch.as_bytes()[0] as u32;
+    }
+    match name {
+        "backquote" => '`' as u32,
+        "backslash" => '\\' as u32,
+        "bracket_left" => '[' as u32,
+        "bracket_right" => ']' as u32,
+        "comma" => ',' as u32,
+        "equal" => '=' as u32,
+        "minus" => '-' as u32,
+        "period" => '.' as u32,
+        "quote" => '\'' as u32,
+        "semicolon" => ';' as u32,
+        "slash" => '/' as u32,
+        "space" => ' ' as u32,
+        _ => 0,
+    }
+}
+
+/// Maps W3C/Rex snake_case key names to `GhosttyKey` (`vendor/ghostty/include/ghostty/vt/key/event.h`).
+fn rex_ghostty_key(name: &str) -> i32 {
+    match name {
+        "unidentified" | "" => 0,
+        "backquote" => 1,
+        "backslash" => 2,
+        "bracket_left" => 3,
+        "bracket_right" => 4,
+        "comma" => 5,
+        "digit_0" => 6,
+        "digit_1" => 7,
+        "digit_2" => 8,
+        "digit_3" => 9,
+        "digit_4" => 10,
+        "digit_5" => 11,
+        "digit_6" => 12,
+        "digit_7" => 13,
+        "digit_8" => 14,
+        "digit_9" => 15,
+        "equal" => 16,
+        "intl_backslash" => 17,
+        "intl_ro" => 18,
+        "intl_yen" => 19,
+        "key_a" => 20,
+        "key_b" => 21,
+        "key_c" => 22,
+        "key_d" => 23,
+        "key_e" => 24,
+        "key_f" => 25,
+        "key_g" => 26,
+        "key_h" => 27,
+        "key_i" => 28,
+        "key_j" => 29,
+        "key_k" => 30,
+        "key_l" => 31,
+        "key_m" => 32,
+        "key_n" => 33,
+        "key_o" => 34,
+        "key_p" => 35,
+        "key_q" => 36,
+        "key_r" => 37,
+        "key_s" => 38,
+        "key_t" => 39,
+        "key_u" => 40,
+        "key_v" => 41,
+        "key_w" => 42,
+        "key_x" => 43,
+        "key_y" => 44,
+        "key_z" => 45,
+        "minus" => 46,
+        "period" => 47,
+        "quote" => 48,
+        "semicolon" => 49,
+        "slash" => 50,
+        "alt_left" => 51,
+        "alt_right" => 52,
+        "backspace" => 53,
+        "caps_lock" => 54,
+        "context_menu" => 55,
+        "control_left" => 56,
+        "control_right" => 57,
+        "enter" => 58,
+        "meta_left" => 59,
+        "meta_right" => 60,
+        "shift_left" => 61,
+        "shift_right" => 62,
+        "space" => 63,
+        "tab" => 64,
+        "convert" => 65,
+        "kana_mode" => 66,
+        "non_convert" => 67,
+        "delete" => 68,
+        "end" => 69,
+        "help" => 70,
+        "home" => 71,
+        "insert" => 72,
+        "page_down" => 73,
+        "page_up" => 74,
+        "arrow_down" => 75,
+        "arrow_left" => 76,
+        "arrow_right" => 77,
+        "arrow_up" => 78,
+        "num_lock" => 79,
+        "numpad_0" => 80,
+        "numpad_1" => 81,
+        "numpad_2" => 82,
+        "numpad_3" => 83,
+        "numpad_4" => 84,
+        "numpad_5" => 85,
+        "numpad_6" => 86,
+        "numpad_7" => 87,
+        "numpad_8" => 88,
+        "numpad_9" => 89,
+        "numpad_add" => 90,
+        "numpad_backspace" => 91,
+        "numpad_clear" => 92,
+        "numpad_clear_entry" => 93,
+        "numpad_comma" => 94,
+        "numpad_decimal" => 95,
+        "numpad_divide" => 96,
+        "numpad_enter" => 97,
+        "numpad_equal" => 98,
+        "numpad_memory_add" => 99,
+        "numpad_memory_clear" => 100,
+        "numpad_memory_recall" => 101,
+        "numpad_memory_store" => 102,
+        "numpad_memory_subtract" => 103,
+        "numpad_multiply" => 104,
+        "numpad_paren_left" => 105,
+        "numpad_paren_right" => 106,
+        "numpad_subtract" => 107,
+        "numpad_separator" => 108,
+        "numpad_up" => 109,
+        "numpad_down" => 110,
+        "numpad_right" => 111,
+        "numpad_left" => 112,
+        "numpad_begin" => 113,
+        "numpad_home" => 114,
+        "numpad_end" => 115,
+        "numpad_insert" => 116,
+        "numpad_delete" => 117,
+        "numpad_page_up" => 118,
+        "numpad_page_down" => 119,
+        "escape" => 120,
+        "f1" => 121,
+        "f2" => 122,
+        "f3" => 123,
+        "f4" => 124,
+        "f5" => 125,
+        "f6" => 126,
+        "f7" => 127,
+        "f8" => 128,
+        "f9" => 129,
+        "f10" => 130,
+        "f11" => 131,
+        "f12" => 132,
+        "f13" => 133,
+        "f14" => 134,
+        "f15" => 135,
+        "f16" => 136,
+        "f17" => 137,
+        "f18" => 138,
+        "f19" => 139,
+        "f20" => 140,
+        "f21" => 141,
+        "f22" => 142,
+        "f23" => 143,
+        "f24" => 144,
+        "f25" => 145,
+        "fn" => 146,
+        "fn_lock" => 147,
+        "print_screen" => 148,
+        "scroll_lock" => 149,
+        "pause" => 150,
+        "browser_back" => 151,
+        "browser_favorites" => 152,
+        "browser_forward" => 153,
+        "browser_home" => 154,
+        "browser_refresh" => 155,
+        "browser_search" => 156,
+        "browser_stop" => 157,
+        "eject" => 158,
+        "launch_app_1" => 159,
+        "launch_app_2" => 160,
+        "launch_mail" => 161,
+        "media_play_pause" => 162,
+        "media_select" => 163,
+        "media_stop" => 164,
+        "media_track_next" => 165,
+        "media_track_previous" => 166,
+        "power" => 167,
+        "sleep" => 168,
+        "audio_volume_down" => 169,
+        "audio_volume_mute" => 170,
+        "audio_volume_up" => 171,
+        "wake_up" => 172,
+        "copy" => 173,
+        "cut" => 174,
+        "paste" => 175,
+        _ => 0,
+    }
 }
 
 pub fn encode_rex_key(k: &Value) -> (Vec<u8>, Vec<String>) {

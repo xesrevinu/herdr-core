@@ -215,6 +215,9 @@ fn register_all(srv: &RexServer, b: &Arc<RexBridge>) {
 
     reg(srv, b, "server.status", |b, _, _| async move { ops::h_status(&b).await });
     reg(srv, b, "server.version", |_, _, _| async move { ops::h_version().await });
+    reg(srv, b, "server.apple.grant_file_access", |_, c, p| async move {
+        ops::h_grant_file_access(&c, &p).await
+    });
     reg(srv, b, "session.list", |b, _, _| async move { ops::h_list(&b).await });
     reg(srv, b, "session.view", |b, _, p| async move { ops::h_view(&b, &p).await });
     reg(srv, b, "session.attach", |b, c, p| async move { ops::h_attach(&b, &c, &p).await });

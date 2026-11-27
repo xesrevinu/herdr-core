@@ -11,7 +11,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 pub const CONTROL_PROTOCOL: &str = "rex.control.v1";
 pub const DATA_PROTOCOL: &str = "rex.data.terminal.v1";
 pub const DATA_BYTES_PROTOCOL: &str = "rex.data.bytes.v1";
-pub const API_REVISION: i64 = 7;
+pub const API_REVISION: i64 = 11;
 pub const API_MIN_REVISION: i64 = 7;
 pub const MAX_MESSAGE_BYTES: usize = 1 << 20;
 
@@ -33,6 +33,7 @@ pub const CLOSE_PROVIDER_UNAVAILABLE: u16 = 1008;
 pub const CLOSE_PROVIDER_FAILED: u16 = 1011;
 pub const CLOSE_RECONNECT_REQUIRED: u16 = 1013;
 pub const CLOSE_BLOCK_CLOSED: u16 = 4000;
+pub const CLOSE_PROTOCOL_VIOLATION: u16 = 4006;
 
 pub const BLANK_SNAPSHOT: &[u8] = include_bytes!("assets/blank_80x24.snap");
 pub const REX_HELP_JSON: &str = include_str!("assets/rex-help.json");
