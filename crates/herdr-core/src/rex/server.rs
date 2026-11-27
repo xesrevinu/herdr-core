@@ -1160,6 +1160,7 @@ impl RexServer {
                                         reason: reason.into(),
                                     }))),
                                 ).await;
+                                let _ = tokio::time::timeout(CONTROL_WRITE_TIMEOUT, ws_tx.flush()).await;
                                 break;
                             }
                             None => break,
@@ -1188,9 +1189,9 @@ impl RexServer {
                 closed_rx,
             };
             serve_fn(st).await;
-            let _ = closed_tx.send(true);
             reader.abort();
             let _ = writer.await;
+            let _ = closed_tx.send(true);
         }
     }
 }
