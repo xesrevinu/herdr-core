@@ -88,6 +88,7 @@ pub fn serve() -> io::Result<()> {
         tokio::spawn(core.clone().watch_foreground());
         tokio::spawn(core.clone().save_when_due());
         tokio::spawn(core.clone().expire_image_answers());
+        let rex_guard = crate::rex::maybe_start(core.clone()).await?;
         let term = platform::termination();
         tokio::pin!(term);
         loop {
@@ -104,6 +105,7 @@ pub fn serve() -> io::Result<()> {
                 }
             }
         }
+        drop(rex_guard);
         platform::remove_endpoint(&socket);
         finish(&core).await
     })
@@ -364,7 +366,6 @@ async fn write_frames(core: Arc<Core>, conn: Arc<Conn>, mut write: Writer) -> io
 }
 
 async fn read_frames(core: &Arc<Core>, conn: &Arc<Conn>, read: &mut Reader) -> io::Result<()> {
-    let u16_at = |p: &[u8], i: usize| u16::from_le_bytes([p[i], p[i + 1]]);
     // Execs and puts running for this connection by request id: they end when it
     // closes, or when it gives up on one (`$/cancelRequest`).
     let mut execs = Execs::default();
@@ -423,29 +424,63 @@ async fn read_frames(core: &Arc<Core>, conn: &Arc<Conn>, read: &mut Reader) -> i
                 }
             }
             (0, _) => {}
-            (ch, wire::DATA) => core.viewer_input(conn, ch, &payload, false),
-            (ch, wire::AUTOMATIC_INPUT) => core.viewer_input(conn, ch, &payload, true),
-            (ch, wire::CREDIT) if payload.len() == 4 => {
-                let n = u32::from_le_bytes(payload[..4].try_into().unwrap()) as usize;
-                conn.with(|out| out.credit(ch, n));
-            }
-            (ch, wire::RESIZE) if payload.len() == 4 => {
-                core.viewer_resize(conn, ch, u16_at(&payload, 0), u16_at(&payload, 2))
-            }
-            (ch, wire::FOCUS) => core.viewer_focus(conn, ch, payload.first() == Some(&1)),
-            (ch, wire::FACTS) => {
-                if let Ok(display) = serde_json::from_slice(&payload) {
-                    core.viewer_facts(conn, ch, display);
-                }
-            }
-            (ch, wire::CLOSE) => {
-                core.detach(conn, Some(ch));
-                conn.with(|out| out.close(ch, b""));
-            }
-            _ => {}
+            (ch, kind) => dispatch_frame_internal(core, conn, ch, kind, &payload),
         }
     }
     Ok(())
+}
+
+/// Dispatches an in-process viewer frame onto local or relayed terminal channels.
+pub(crate) fn dispatch_frame_internal(core: &Arc<Core>, conn: &Arc<Conn>, channel: u32, kind: u8, payload: &[u8]) {
+    if channel != 0 && crate::remote::relay_in(core, conn, channel, kind, payload) {
+        return;
+    }
+    let u16_at = |p: &[u8], i: usize| u16::from_le_bytes([p[i], p[i + 1]]);
+    match kind {
+        wire::DATA => core.viewer_input(conn, channel, payload, false),
+        wire::AUTOMATIC_INPUT => core.viewer_input(conn, channel, payload, true),
+        wire::CREDIT if payload.len() == 4 => {
+            let n = u32::from_le_bytes(payload[..4].try_into().unwrap()) as usize;
+            conn.with(|out| out.credit(channel, n));
+        }
+        wire::RESIZE if payload.len() == 4 => {
+            core.viewer_resize(conn, channel, u16_at(payload, 0), u16_at(payload, 2));
+        }
+        wire::FOCUS => core.viewer_focus(conn, channel, payload.first() == Some(&1)),
+        wire::FACTS => {
+            if let Ok(display) = serde_json::from_slice(payload) {
+                core.viewer_facts(conn, channel, display);
+            }
+        }
+        wire::CLOSE => {
+            core.detach(conn, Some(channel));
+            conn.with(|out| out.close(channel, b""));
+        }
+        _ => {}
+    }
+}
+
+/// Calls any local or remote herdr-core JSON-RPC method directly in-process.
+pub(crate) async fn call_internal(
+    core: &Arc<Core>,
+    conn: Option<&Arc<Conn>>,
+    method: &str,
+    params: Value,
+) -> Result<Value, RpcError> {
+    let call = api::Call { core, conn, plain: None };
+    match crate::remote::route(core, method, &params) {
+        Ok(Some((crate::remote::To::Machine(machine), params))) if method == "terminal.attach" => match conn {
+            Some(conn) => crate::remote::attach(core, conn, &machine, params).await,
+            None => Err(RpcError::new(
+                "needs_framed",
+                "attach needs a framed connection",
+                "provide an in-process Conn",
+            )),
+        },
+        Ok(Some((to, params))) => crate::remote::forward_to(core, &to, method, params).await,
+        Ok(None) => api::dispatch(&call, method, params).await,
+        Err(e) => Err(e),
+    }
 }
 
 /// Only the draft hold observes cancellation; input already being typed must finish.

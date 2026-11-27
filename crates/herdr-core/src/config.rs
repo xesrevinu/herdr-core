@@ -35,6 +35,14 @@ pub struct Config {
     /// timeout on top), and to send anything at all before its line is
     /// given up and dialed again (default 30).
     pub machine_timeout: Option<f64>,
+    /// Optional embedded Rex host listener (`ip:port` or `unix:///PATH`). `HERDR_REX_LISTEN` wins.
+    pub rex_listen: Option<String>,
+    /// Send desktop_notification events to Rex clients (default true). `HERDR_REX_NOTIFY` wins.
+    pub rex_notify: Option<bool>,
+    /// Attach Rex viewers as observers without sending keys/resizes (default false). `HERDR_REX_OBSERVE` wins.
+    pub rex_observe: Option<bool>,
+    /// Directory containing Rex init.lua and keymap.json. `REX_CONFIG` wins.
+    pub rex_config: Option<String>,
 }
 
 fn seconds<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<Duration>, D::Error> {

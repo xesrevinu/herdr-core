@@ -267,7 +267,7 @@ impl Core {
                     }
                     Err(mpsc::error::TrySendError::Closed(_)) => false,
                 },
-                Sink::Waiter(_) => true,
+                Sink::Waiter(tx) => tx.send(json!({"type": "missed"})).is_ok(),
             }
         });
         st.events.subs = subs;
