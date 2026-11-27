@@ -956,6 +956,8 @@ pub fn infer_home(on: &str, terms: &HashMap<String, TerminalRec>) -> String {
         if parts.len() >= 3 && (parts[1] == "Users" || parts[1] == "home") {
             let h = format!("/{}/{}", parts[1], parts[2]);
             *counts.entry(h).or_default() += 1;
+        } else if parts.get(1) == Some(&"root") {
+            *counts.entry("/root".into()).or_default() += 1;
         }
     }
     counts.into_iter().max_by_key(|(_, n)| *n).map(|(h, _)| h).unwrap_or_default()
